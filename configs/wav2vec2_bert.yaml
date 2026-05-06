@@ -1,0 +1,70 @@
+# =====================================================================
+# Wav2Vec2-BERT-UK-v2.1 fine-tuning configuration
+# ---------------------------------------------------------------------
+# Consumed by ``models/wav2vec2_bert_trainer.py``.
+#
+#   python train.py --model_type wav2vec2_bert --variant w2v-bert-uk-v2.1
+#
+# The paper reports that *adapter* tuning outperforms LoRA on this
+# checkpoint.  The trainer therefore freezes the feature encoder and a
+# configurable number of lower transformer layers, leaving the
+# adapters and the CTC head trainable.  Augmentation is the "strong"
+# preset from ``utils.augmentation``.
+# =====================================================================
+
+defaults:
+  sample_rate: 16000
+
+  # Schedule -----------------------------------------------------------
+  learning_rate: 5.0e-5
+  warmup_steps: 800
+  lr_scheduler_type: linear
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  optimizer: adamw_torch
+
+  # Cadence ------------------------------------------------------------
+  eval_steps: 500
+  save_steps: 500
+  logging_steps: 50
+  save_total_limit: 3
+
+  # Mixed precision / memory ------------------------------------------
+  fp16: true
+  bf16: false
+  gradient_checkpointing: true
+
+  # Best-checkpoint selection -----------------------------------------
+  metric_for_best_model: cer
+  greater_is_better: false
+  load_best_model_at_end: true
+  early_stopping_patience: 5
+  early_stopping_threshold: 0.0
+
+  # Adapter / freezing strategy ---------------------------------------
+  freeze_feature_encoder: true       # ``feature_projection`` + conv front-end
+  freeze_lower_transformer_layers: 6 # bottom-N encoder layers
+  train_adapters: true               # adapters & LM head only
+  ctc_loss_reduction: mean
+  ctc_zero_infinity: true
+
+  # Augmentation policy ------------------------------------------------
+  use_augmentation: true
+  augmentation_strong: true          # paper recommends stronger aug.
+
+  # Misc --------------------------------------------------------------
+  remove_unused_columns: false
+  group_by_length: true
+  length_column_name: input_length
+  dataloader_num_workers: 2
+  report_to: [tensorboard]
+  seed: 42
+
+variants:
+
+  w2v-bert-uk-v2.1:
+    model_name_or_path: Yehor/w2v-bert-uk-v2.1
+    max_steps: 5000
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 4   # effective batch 32

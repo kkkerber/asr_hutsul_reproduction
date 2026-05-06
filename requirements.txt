@@ -1,0 +1,46 @@
+# =====================================================================
+# ASR Hutsul Reproduction — Pinned dependency list
+# ---------------------------------------------------------------------
+# Pins are chosen to match the modern Hugging Face stack (late 2024 /
+# early 2025).  All scripts in this project are written against these
+# APIs.  If you upgrade, please consult the troubleshooting section of
+# README.md — several Trainer / PEFT arguments have been renamed across
+# minor releases.
+# =====================================================================
+
+# ---- Core deep-learning stack ----------------------------------------
+torch>=2.2,<2.6
+torchaudio>=2.2,<2.6
+
+# ---- Hugging Face ecosystem ------------------------------------------
+transformers>=4.45,<4.50
+datasets>=2.20,<3.3
+evaluate>=0.4.2,<0.5
+accelerate>=0.34,<1.5
+peft>=0.12,<0.15
+tokenizers>=0.20,<0.22
+huggingface-hub>=0.25,<0.30
+safetensors>=0.4.3
+
+# ---- Audio I/O & processing ------------------------------------------
+librosa>=0.10.2
+soundfile>=0.12.1
+audioread>=3.0.1
+audiomentations>=0.36.0
+
+# ---- Metrics ----------------------------------------------------------
+jiwer>=3.0.4
+
+# ---- Utilities --------------------------------------------------------
+numpy>=1.26,<2.2
+scipy>=1.11
+pandas>=2.1
+PyYAML>=6.0.1
+tqdm>=4.66
+tensorboard>=2.16
+matplotlib>=3.8
+scikit-learn>=1.4
+
+# ---- Notebook support (optional but used by notebooks/) --------------
+ipywidgets>=8.1
+ipykernel>=6.29

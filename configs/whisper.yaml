@@ -1,0 +1,102 @@
+# =====================================================================
+# Whisper-family fine-tuning configuration
+# ---------------------------------------------------------------------
+# This file is consumed by ``models/whisper_trainer.py``.  Pick a
+# variant via the CLI:
+#
+#   python train.py --model_type whisper --variant whisper-small
+#   python train.py --model_type whisper --variant whisper-medium
+#   python train.py --model_type whisper --variant whisper-large-v3
+#   python train.py --model_type whisper --variant whisper-large-uk-2
+#
+# Hyper-parameters mirror those reported in the paper.  All four
+# variants use LoRA fine-tuning with target_modules=[q_proj, v_proj]
+# and CER as the metric for best-checkpoint selection.
+# =====================================================================
+
+defaults:
+  # Whisper expects 16-kHz mono.
+  sample_rate: 16000
+
+  # Generation / decoding -----------------------------------------------
+  language: uk            # Whisper accepts both "uk" and "ukrainian".
+  task: transcribe
+  generation_max_length: 225
+  num_beams: 1            # greedy at training-time eval (faster, paper-style)
+
+  # Training schedule ---------------------------------------------------
+  optimizer: adamw_torch
+  learning_rate: 1.0e-4
+  warmup_steps: 500
+  lr_scheduler_type: linear
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+
+  # Logging / eval / checkpoint cadence --------------------------------
+  eval_steps: 500
+  save_steps: 500
+  logging_steps: 50
+  save_total_limit: 3
+
+  # Mixed precision / memory -------------------------------------------
+  fp16: true
+  bf16: false
+  gradient_checkpointing: true
+  predict_with_generate: true
+
+  # Best-checkpoint selection ------------------------------------------
+  metric_for_best_model: cer
+  greater_is_better: false
+  load_best_model_at_end: true
+  early_stopping_patience: 5
+  early_stopping_threshold: 0.0
+
+  # PEFT / LoRA ---------------------------------------------------------
+  use_lora: true
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    bias: none
+    target_modules: [q_proj, v_proj]
+    task_type: SEQ_2_SEQ_LM
+
+  # Misc ---------------------------------------------------------------
+  remove_unused_columns: false
+  group_by_length: false
+  dataloader_num_workers: 2
+  report_to: [tensorboard]
+  seed: 42
+
+# ---------------------------------------------------------------------
+# Variants
+# ---------------------------------------------------------------------
+variants:
+
+  whisper-small:
+    model_name_or_path: openai/whisper-small
+    max_steps: 8000
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 4   # effective batch 16
+
+  whisper-medium:
+    model_name_or_path: openai/whisper-medium
+    max_steps: 8000
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 4   # effective batch 32
+
+  whisper-large-v3:
+    model_name_or_path: openai/whisper-large-v3
+    max_steps: 8000
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 2
+    gradient_accumulation_steps: 4   # effective batch 16
+
+  whisper-large-uk-2:
+    model_name_or_path: arampacha/whisper-large-uk-2
+    max_steps: 4000
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 2
+    gradient_accumulation_steps: 4   # effective batch 16

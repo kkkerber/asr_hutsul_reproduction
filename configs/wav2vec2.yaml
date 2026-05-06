@@ -1,0 +1,79 @@
+# =====================================================================
+# Wav2Vec2-XLSR (CTC) fine-tuning configuration
+# ---------------------------------------------------------------------
+# Consumed by ``models/wav2vec2_trainer.py``.
+#
+#   python train.py --model_type wav2vec2 --variant xlsr-300m-uk
+#
+# The base model is the multilingual XLSR-53 checkpoint, which the
+# paper fine-tunes on the Hutsul corpus.  An alternative, already
+# Ukrainian-pre-trained checkpoint can be selected via
+# ``--model_name_or_path`` from the CLI to override this file.
+# =====================================================================
+
+defaults:
+  sample_rate: 16000
+
+  # Schedule (paper) ----------------------------------------------------
+  learning_rate: 1.0e-4
+  warmup_steps: 1000
+  lr_scheduler_type: linear
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  optimizer: adamw_torch
+
+  # Cadence -------------------------------------------------------------
+  eval_steps: 500
+  save_steps: 500
+  logging_steps: 50
+  save_total_limit: 3
+
+  # Mixed precision / memory -------------------------------------------
+  fp16: true
+  bf16: false
+  gradient_checkpointing: true
+
+  # Best-checkpoint selection ------------------------------------------
+  metric_for_best_model: cer
+  greater_is_better: false
+  load_best_model_at_end: true
+  early_stopping_patience: 5
+  early_stopping_threshold: 0.0
+
+  # CTC-specific --------------------------------------------------------
+  ctc_loss_reduction: mean
+  ctc_zero_infinity: true
+  freeze_feature_encoder: true   # standard for XLSR fine-tuning
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  feat_proj_dropout: 0.0
+  mask_time_prob: 0.05
+  mask_feature_prob: 0.0
+  layerdrop: 0.0
+
+  # Misc ---------------------------------------------------------------
+  remove_unused_columns: false
+  group_by_length: true
+  length_column_name: input_length
+  dataloader_num_workers: 2
+  report_to: [tensorboard]
+  seed: 42
+
+variants:
+
+  xlsr-300m-uk:
+    model_name_or_path: facebook/wav2vec2-large-xlsr-53
+    max_steps: 5000
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 8       # effective batch 64
+
+  xlsr-300m-uk-pretrained:
+    # If you prefer a Ukrainian-pretrained XLSR checkpoint, switch to
+    # this variant.  Replace the model id with whichever Ukrainian
+    # checkpoint you wish to compare against.
+    model_name_or_path: Yehor/wav2vec2-xls-r-300m-uk-with-lm
+    max_steps: 5000
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 8
