@@ -17,7 +17,9 @@ PEFT >= 0.12, accelerate >= 0.34):
   token during evaluation.
 * PEFT LoRA is applied with ``target_modules=["q_proj", "v_proj"]``,
   ``r=16``, ``lora_alpha=32``, ``lora_dropout=0.05``, ``bias="none"``
-  and ``task_type=TaskType.SEQ_2_SEQ_LM``.
+  and **no** ``task_type`` (using the generic :class:`peft.PeftModel`
+  wrapper — the seq2seq wrapper would inject ``input_ids`` into
+  Whisper's forward and crash it).
 * The Trainer is :class:`Seq2SeqTrainer` with
   ``predict_with_generate=True`` and the modern
   ``eval_strategy`` argument (the old ``evaluation_strategy`` was
@@ -273,15 +275,35 @@ def maybe_apply_lora(
     if not args.use_lora:
         return model
 
-    from peft import LoraConfig, TaskType, get_peft_model
+    from peft import LoraConfig, get_peft_model
 
+    # IMPORTANT: do *not* set ``task_type`` here.
+    #
+    # Setting ``task_type=TaskType.SEQ_2_SEQ_LM`` causes
+    # ``peft.get_peft_model`` to wrap the model in
+    # :class:`peft.PeftModelForSeq2SeqLM`, which is a text-to-text
+    # seq2seq wrapper.  Its ``forward`` hard-codes a text-input
+    # signature (``input_ids=None``, ``inputs_embeds=None``, ...) and
+    # explicitly passes ``input_ids=...`` and ``inputs_embeds=...``
+    # to the base model — both kwargs that
+    # :class:`WhisperForConditionalGeneration.forward` does not
+    # accept (Whisper expects ``input_features``).  Forward then
+    # raises:
+    #
+    #   TypeError: WhisperForConditionalGeneration.forward() got an
+    #              unexpected keyword argument 'input_ids'
+    #
+    # Leaving ``task_type`` unset (or ``None``) makes
+    # ``get_peft_model`` return the generic :class:`peft.PeftModel`
+    # whose ``forward`` simply delegates ``*args, **kwargs`` to the
+    # base model.  This is what the official HF Whisper-LoRA
+    # fine-tuning recipe uses.
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         target_modules=list(args.lora_target_modules),
         lora_dropout=args.lora_dropout,
         bias=args.lora_bias,
-        task_type=TaskType.SEQ_2_SEQ_LM,
     )
 
     # When using PEFT + gradient checkpointing the input embeddings'

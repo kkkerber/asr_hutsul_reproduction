@@ -59,7 +59,13 @@ defaults:
     lora_dropout: 0.05
     bias: none
     target_modules: [q_proj, v_proj]
-    task_type: SEQ_2_SEQ_LM
+    # NOTE: ``task_type`` is intentionally NOT set for Whisper.
+    #
+    # Setting ``task_type: SEQ_2_SEQ_LM`` would make peft wrap the
+    # model in ``PeftModelForSeq2SeqLM``, whose forward() forwards
+    # ``input_ids=`` to the base model — a kwarg
+    # ``WhisperForConditionalGeneration.forward()`` rejects with
+    # ``TypeError``.  The trainer ignores any value placed here.
 
   # Misc ---------------------------------------------------------------
   remove_unused_columns: false

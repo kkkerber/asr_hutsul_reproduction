@@ -66,6 +66,11 @@ def _detect_input_key(sample: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_WHISPER_ALLOWED_KEYS = frozenset(
+    {"input_features", "attention_mask", "labels"}
+)
+
+
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     """Whisper-compatible padding collator.
@@ -87,11 +92,19 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         SpecAugment stage is applied to the padded ``input_features``
         tensor.  The waveform stage of the pipeline is *not* executed
         here — that runs earlier in the dataset ``map`` step.
+    enforce_keys
+        Defence-in-depth.  When ``True`` (the default), the collator
+        actively scrubs any key from the returned batch that is not
+        accepted by ``WhisperForConditionalGeneration.forward`` —
+        most importantly ``input_ids`` and ``inputs_embeds``, which
+        a misconfigured ``PeftModelForSeq2SeqLM`` wrapper would
+        otherwise inject and crash the forward pass.
     """
 
     processor: Any
     decoder_start_token_id: Optional[int] = None
     augmentation: Optional[AugmentationPipeline] = None
+    enforce_keys: bool = True
 
     # ------------------------------------------------------------------
     def __post_init__(self) -> None:
@@ -156,6 +169,36 @@ class DataCollatorSpeechSeq2SeqWithPadding:
                     "features.",
                     exc,
                 )
+
+        # 4) Defence-in-depth: scrub anything Whisper.forward cannot
+        #    accept.  In practice this is a safety net — the canonical
+        #    cause of stray ``input_ids`` keys in a Whisper batch is a
+        #    PEFT misconfiguration (LoraConfig with task_type=SEQ_2_SEQ_LM)
+        #    which we already fix in ``models.whisper_trainer``.  But if
+        #    a user wires up a custom PEFT wrapper or subclasses this
+        #    collator, the assertion below catches the mistake at the
+        #    collator boundary rather than letting it surface as a
+        #    confusing TypeError inside ``model.forward``.
+        if self.enforce_keys:
+            allowed = _WHISPER_ALLOWED_KEYS
+            extra = [k for k in list(batch.keys()) if k not in allowed]
+            if extra:
+                # ``input_ids`` / ``inputs_embeds`` are the most common
+                # offenders.  Other unknown keys are dropped silently
+                # because some FE configs return e.g.
+                # ``num_frames`` which the model doesn't need.
+                blocking = {"input_ids", "inputs_embeds"}
+                hard = [k for k in extra if k in blocking]
+                if hard:
+                    raise RuntimeError(
+                        "Whisper collator produced disallowed keys "
+                        f"{hard!r} (full batch keys: {list(batch.keys())}).  "
+                        "This is almost always caused by PEFT wrapping the "
+                        "Whisper model in PeftModelForSeq2SeqLM — make sure "
+                        "LoraConfig is constructed WITHOUT task_type."
+                    )
+                for k in extra:
+                    batch.pop(k, None)
 
         return batch
 
