@@ -491,6 +491,24 @@ class ProjectConfig:
     num_workers: int = 2
     use_augmentation: bool = False
 
+    # ---- Audio-length filtering (CTC trainers only) -------------------
+    # Minimum waveform duration in seconds.  Samples shorter than this
+    # are dropped from every split during preprocessing.
+    #
+    # ``None`` (the default) means "no filter" — appropriate for
+    # Whisper, which pads internally to 30 s and is unaffected by very
+    # short clips.  CTC trainers (Wav2Vec2-XLSR, Wav2Vec2-BERT,
+    # OmniASR) set this to a positive value (1.0 s by default) because
+    # ``Wav2Vec2Model._compute_mask_indices`` raises a ``ValueError``
+    # on batches whose padded encoder length is below
+    # ``mask_time_length`` (=10 by default).
+    min_train_audio_duration_sec: Optional[float] = None
+
+    # Minimum waveform sample count the CTC collator will floor-pad
+    # each batch to.  Defence-in-depth on top of the dataset-level
+    # filter above.  ``None`` disables the floor pad.
+    min_collator_input_samples: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

@@ -202,6 +202,18 @@ class Wav2Vec2TrainArgs:
     trust_remote_code: bool = False
     hf_token: Optional[str] = None
 
+    # Audio-length safety (CTC-only) ------------------------------------
+    # Drop dataset samples shorter than this many seconds.  Required
+    # to prevent ``Wav2Vec2Model._compute_mask_indices`` from raising
+    # ``mask_length > sequence_length`` on extreme-short batches.
+    # 1.0 s gives ~50 encoder frames at conv stride 320 — well above
+    # the default ``mask_time_length=10``.
+    min_train_audio_duration_sec: float = 1.0
+    # Defence-in-depth: collator floor-pads any batch whose
+    # ``input_values`` shorter than this number of samples.  Default
+    # 6400 = 0.4 s = 2 × mask_time_length × stride.
+    min_collator_input_samples: int = 6400
+
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -506,6 +518,8 @@ def train_wav2vec2(args: Wav2Vec2TrainArgs) -> Dict[str, float]:
         preprocessed_dir=layout.preprocessed_dir("wav2vec2"),
         dataset_cache_dir=layout.datasets_cache,
         cache_dir=layout.cache,
+        min_train_audio_duration_sec=args.min_train_audio_duration_sec,
+        min_collator_input_samples=args.min_collator_input_samples,
     )
     project_cfg.ensure_dirs()
 
@@ -533,6 +547,7 @@ def train_wav2vec2(args: Wav2Vec2TrainArgs) -> Dict[str, float]:
         processor=processor,
         padding=True,
         augmentation=aug_pipeline,
+        min_input_samples=args.min_collator_input_samples,
     )
 
     metric_calculator = MetricCalculator()

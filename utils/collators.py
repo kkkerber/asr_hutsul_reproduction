@@ -231,6 +231,20 @@ class DataCollatorCTCWithPadding:
     augmentation
         Optional :class:`AugmentationPipeline` — SpecAugment is applied
         on the padded feature tensor when present.
+    min_input_samples
+        Defence-in-depth safety floor.  When set, the collator
+        right-pads ``input_values`` (raw waveform input for
+        Wav2Vec2-XLSR) with zeros so that the batch's time dimension
+        is at least this many samples, and extends the
+        ``attention_mask`` accordingly.  This guards against
+        ``Wav2Vec2Model._mask_hidden_states`` raising
+        ``mask_length > sequence_length`` on pathological short
+        batches that the dataset-level duration filter let through.
+        Default ``None`` disables the floor.
+
+        Recommended value for Wav2Vec2-XLSR
+        (``mask_time_length=10``, conv stride 320): around
+        ``10 × 320 × 2 = 6400`` samples (0.4 s).
     """
 
     processor: Any
@@ -238,6 +252,7 @@ class DataCollatorCTCWithPadding:
     pad_to_multiple_of: Optional[int] = None
     pad_to_multiple_of_labels: Optional[int] = None
     augmentation: Optional[AugmentationPipeline] = None
+    min_input_samples: Optional[int] = None
 
     # ------------------------------------------------------------------
     def __call__(
@@ -274,7 +289,45 @@ class DataCollatorCTCWithPadding:
         )
         batch["labels"] = labels
 
-        # 3) Optional SpecAugment ---------------------------------------------
+        # 3) Safety floor pad on input_values -------------------------------
+        # Only acts on the raw-waveform input (Wav2Vec2-XLSR).  For
+        # ``input_features`` (Wav2Vec2-BERT, OmniASR) the dataset-level
+        # duration filter is the canonical guard — feature-time
+        # padding is not applied here because the feature axes
+        # already use a different rate.
+        if (
+            self.min_input_samples is not None
+            and input_key == "input_values"
+            and batch[input_key].dim() == 2
+        ):
+            current = batch[input_key].shape[1]
+            target = int(self.min_input_samples)
+            if current < target:
+                pad_amt = target - current
+                pad_zeros = torch.zeros(
+                    batch[input_key].shape[0],
+                    pad_amt,
+                    dtype=batch[input_key].dtype,
+                )
+                batch[input_key] = torch.cat(
+                    [batch[input_key], pad_zeros], dim=1
+                )
+                if "attention_mask" in batch:
+                    pad_mask = torch.zeros(
+                        batch["attention_mask"].shape[0],
+                        pad_amt,
+                        dtype=batch["attention_mask"].dtype,
+                    )
+                    batch["attention_mask"] = torch.cat(
+                        [batch["attention_mask"], pad_mask], dim=1
+                    )
+                logger.debug(
+                    "Floor-padded input_values from %d -> %d samples",
+                    current,
+                    target,
+                )
+
+        # 4) Optional SpecAugment ---------------------------------------------
         if self.augmentation is not None and self.augmentation.specaugment is not None:
             try:
                 batch[input_key] = self.augmentation.apply_features(

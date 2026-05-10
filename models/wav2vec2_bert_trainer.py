@@ -219,6 +219,14 @@ class Wav2Vec2BertTrainArgs:
     trust_remote_code: bool = False
     hf_token: Optional[str] = None
 
+    # Audio-length safety -------------------------------------------------
+    # See ``Wav2Vec2TrainArgs`` for the rationale.  Wav2Vec2-BERT
+    # consumes pre-extracted log-mel features, so the collator-level
+    # floor pad is a no-op for this trainer; the dataset filter is
+    # the only active safeguard.
+    min_train_audio_duration_sec: float = 1.0
+    min_collator_input_samples: int = 0  # no-op for input_features path
+
 
 # ---------------------------------------------------------------------------
 # YAML loader
@@ -608,6 +616,7 @@ def train_wav2vec2_bert(args: Wav2Vec2BertTrainArgs) -> Dict[str, float]:
         preprocessed_dir=layout.preprocessed_dir("wav2vec2_bert"),
         dataset_cache_dir=layout.datasets_cache,
         cache_dir=layout.cache,
+        min_train_audio_duration_sec=args.min_train_audio_duration_sec,
     )
     project_cfg.ensure_dirs()
 

@@ -162,6 +162,13 @@ class OmniASRTrainArgs:
     trust_remote_code: bool = True
     hf_token: Optional[str] = None
 
+    # Audio-length safety (CTC) -----------------------------------------
+    # OmniASR ships custom modeling code; we cannot inspect its
+    # masking parameters generically.  Apply the same dataset-level
+    # filter as the other CTC trainers as a precaution.
+    min_train_audio_duration_sec: float = 1.0
+    min_collator_input_samples: int = 0  # no-op for input_features path
+
 
 # ---------------------------------------------------------------------------
 # YAML loader
@@ -529,6 +536,7 @@ def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
         preprocessed_dir=layout.preprocessed_dir("omniasr"),
         dataset_cache_dir=layout.datasets_cache,
         cache_dir=layout.cache,
+        min_train_audio_duration_sec=args.min_train_audio_duration_sec,
     )
     project_cfg.ensure_dirs()
 

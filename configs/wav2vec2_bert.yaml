@@ -52,6 +52,12 @@ defaults:
   use_augmentation: true
   augmentation_strong: true          # paper recommends stronger aug.
 
+  # Audio-length safety (CTC) -----------------------------------------
+  min_train_audio_duration_sec: 1.0
+  # Wav2Vec2-BERT consumes pre-extracted features, so the collator
+  # floor-pad on ``input_values`` is a no-op for this trainer.
+  min_collator_input_samples: 0
+
   # Misc --------------------------------------------------------------
   remove_unused_columns: false
   group_by_length: true

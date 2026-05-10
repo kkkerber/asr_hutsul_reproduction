@@ -241,6 +241,181 @@ def split_dataset(
 
 
 # ---------------------------------------------------------------------------
+# Audio-duration diagnostics + filter (CTC trainers only)
+# ---------------------------------------------------------------------------
+
+
+def compute_duration_diagnostics(
+    ds: Union[Dataset, DatasetDict],
+    audio_column: str,
+    sample_rate: int = TARGET_SAMPLE_RATE,
+) -> Dict[str, Any]:
+    """Return a dict of duration statistics for ``ds``.
+
+    Cheap when the audio column is the HF ``Audio`` feature: we read
+    the cached length-in-samples from each example without decoding
+    the waveform.  When that column is unavailable we fall back to
+    decoding the array (slower; only triggered for non-cast datasets).
+
+    The returned dict is suitable for direct ``logger.info`` printing
+    and for cross-run comparisons (it is JSON-serialisable).
+    """
+    splits = ds.keys() if isinstance(ds, DatasetDict) else ("__single__",)
+    out: Dict[str, Any] = {}
+    for name in splits:
+        split_ds = ds[name] if isinstance(ds, DatasetDict) else ds
+        durations: List[float] = []
+        for example in split_ds:
+            audio = example[audio_column]
+            # The HF ``Audio`` feature decodes lazily into ``array`` —
+            # ``len(array)`` is the sample count after resampling.
+            if isinstance(audio, dict) and "array" in audio:
+                arr = audio["array"]
+                sr = int(audio.get("sampling_rate", sample_rate))
+                durations.append(len(arr) / sr)
+            else:
+                # Path-only column; we cannot measure cheaply.
+                durations.append(float("nan"))
+
+        arr = np.asarray(
+            [d for d in durations if not np.isnan(d)], dtype=np.float64
+        )
+        if arr.size == 0:
+            stats = {
+                "count": len(durations),
+                "min_sec": None,
+                "max_sec": None,
+                "mean_sec": None,
+                "median_sec": None,
+                "below_0.2s": None,
+                "below_0.5s": None,
+                "below_1.0s": None,
+            }
+        else:
+            stats = {
+                "count": int(arr.size),
+                "min_sec": float(arr.min()),
+                "max_sec": float(arr.max()),
+                "mean_sec": float(arr.mean()),
+                "median_sec": float(np.median(arr)),
+                "below_0.2s": int((arr < 0.2).sum()),
+                "below_0.5s": int((arr < 0.5).sum()),
+                "below_1.0s": int((arr < 1.0).sum()),
+            }
+        out[name] = stats
+    return out
+
+
+def _log_duration_diagnostics(
+    diag: Dict[str, Any],
+    *,
+    threshold_sec: Optional[float] = None,
+) -> None:
+    """Pretty-print the diagnostic dict at INFO level."""
+    logger.info("--- Audio-duration diagnostics ---")
+    for split, s in diag.items():
+        if s.get("count", 0) == 0 or s.get("min_sec") is None:
+            logger.info(
+                "  [%s] no measurable durations (path-only column?)", split
+            )
+            continue
+        logger.info(
+            "  [%s] count=%d  min=%.3fs  max=%.3fs  mean=%.3fs  median=%.3fs",
+            split,
+            s["count"],
+            s["min_sec"],
+            s["max_sec"],
+            s["mean_sec"],
+            s["median_sec"],
+        )
+        logger.info(
+            "  [%s] below 0.2s=%d   below 0.5s=%d   below 1.0s=%d",
+            split,
+            s["below_0.2s"],
+            s["below_0.5s"],
+            s["below_1.0s"],
+        )
+        if threshold_sec is not None:
+            key = (
+                "below_0.2s"
+                if abs(threshold_sec - 0.2) < 1e-6
+                else "below_0.5s"
+                if abs(threshold_sec - 0.5) < 1e-6
+                else "below_1.0s"
+                if abs(threshold_sec - 1.0) < 1e-6
+                else None
+            )
+            if key:
+                logger.info(
+                    "  [%s] WILL BE FILTERED at %.2fs threshold: %d",
+                    split,
+                    threshold_sec,
+                    s[key],
+                )
+
+
+def filter_short_audio(
+    ds: DatasetDict,
+    *,
+    audio_column: str,
+    min_duration_sec: float,
+    sample_rate: int = TARGET_SAMPLE_RATE,
+    splits: Optional[Tuple[str, ...]] = None,
+    num_proc: Optional[int] = None,
+) -> DatasetDict:
+    """Drop samples whose waveform is shorter than ``min_duration_sec``.
+
+    Parameters
+    ----------
+    splits
+        Which split names to apply the filter to.  ``None`` (the
+        default) applies to every split — appropriate for CTC training
+        where short clips also break encoder-time masking at
+        evaluation time, and where the test split should mirror the
+        train distribution.
+    """
+    if min_duration_sec is None or min_duration_sec <= 0:
+        return ds
+
+    target_splits = tuple(ds.keys()) if splits is None else splits
+    min_samples = int(round(min_duration_sec * sample_rate))
+
+    def _keep(example: Dict[str, Any]) -> bool:
+        audio = example.get(audio_column)
+        if audio is None:
+            return False
+        if isinstance(audio, dict) and "array" in audio:
+            return len(audio["array"]) >= min_samples
+        # Cannot evaluate length without decoding — be conservative
+        # and KEEP (the collator's safety pad acts as a backstop).
+        return True
+
+    new_splits: Dict[str, Dataset] = {}
+    for split_name, split_ds in ds.items():
+        if split_name not in target_splits:
+            new_splits[split_name] = split_ds
+            continue
+        before = len(split_ds)
+        filtered = split_ds.filter(
+            _keep,
+            num_proc=num_proc,
+            desc=f"Filtering <{min_duration_sec}s from {split_name}",
+        )
+        after = len(filtered)
+        dropped = before - after
+        logger.info(
+            "[duration-filter] split=%s  kept=%d/%d (dropped %d, %.2f%%)",
+            split_name,
+            after,
+            before,
+            dropped,
+            100.0 * dropped / max(1, before),
+        )
+        new_splits[split_name] = filtered
+    return DatasetDict(new_splits)
+
+
+# ---------------------------------------------------------------------------
 # Normalisation pass over a DatasetDict
 # ---------------------------------------------------------------------------
 
@@ -351,6 +526,10 @@ def load_and_prepare(
     #   2. ``cfg.preprocessed_dir`` (typically points at
     #      ``<storage_root>/preprocessed/<model_type>/`` under Colab)
     #   3. fallback to the layout-resolved preprocessed root
+    #
+    # The cache path is fingerprinted with the active duration filter
+    # so an old, unfiltered cache cannot be silently reused after the
+    # filter is enabled.
     cache_root = (
         Path(cache_dir)
         if cache_dir is not None
@@ -358,7 +537,12 @@ def load_and_prepare(
     )
     cache_root.mkdir(parents=True, exist_ok=True)
     safe_name = dataset_name.replace("/", "__")
-    cache_path = cache_root / f"{safe_name}__{cfg.sample_rate}"
+    filter_tag = (
+        f"__filt{cfg.min_train_audio_duration_sec:g}s"
+        if cfg.min_train_audio_duration_sec
+        else ""
+    )
+    cache_path = cache_root / f"{safe_name}__{cfg.sample_rate}{filter_tag}"
 
     if use_disk_cache and cache_path.exists() and not overwrite_cache:
         logger.info("Loading preprocessed dataset from %s", cache_path)
@@ -406,6 +590,43 @@ def load_and_prepare(
         sample_rate=cfg.sample_rate,
         num_proc=num_proc,
     )
+
+    # ---- Optional duration diagnostic + filter --------------------------
+    # The diagnostic always runs when a filter is configured so the
+    # operator sees how many samples will be removed and why.  It is
+    # intentionally a no-op when ``min_train_audio_duration_sec`` is
+    # None (the Whisper case) — Whisper pads internally to 30 s and
+    # tolerates arbitrarily short clips.
+    if cfg.min_train_audio_duration_sec:
+        try:
+            diag = compute_duration_diagnostics(
+                ds, audio_column=ac, sample_rate=cfg.sample_rate
+            )
+            _log_duration_diagnostics(
+                diag, threshold_sec=cfg.min_train_audio_duration_sec
+            )
+        except Exception as exc:  # pragma: no cover — diagnostic must never crash training
+            logger.warning(
+                "Duration diagnostic failed (%s); proceeding with filter "
+                "anyway.",
+                exc,
+            )
+
+        ds = filter_short_audio(
+            ds,
+            audio_column=ac,
+            min_duration_sec=cfg.min_train_audio_duration_sec,
+            sample_rate=cfg.sample_rate,
+            num_proc=num_proc,
+        )
+        # Sanity: we MUST have at least one row in train after filtering.
+        if "train" in ds and len(ds["train"]) == 0:
+            raise RuntimeError(
+                f"Duration filter at {cfg.min_train_audio_duration_sec}s "
+                "removed every training sample.  Lower the threshold or "
+                "verify that your dataset's audio column was decoded "
+                "correctly."
+            )
 
     # ---- Persist cache --------------------------------------------------
     if use_disk_cache:

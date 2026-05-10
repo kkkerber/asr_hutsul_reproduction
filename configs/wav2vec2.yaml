@@ -51,6 +51,15 @@ defaults:
   mask_feature_prob: 0.0
   layerdrop: 0.0
 
+  # Audio-length safety (CTC) -----------------------------------------
+  # Drop training samples shorter than this (in seconds) and floor-pad
+  # the collator's ``input_values`` so that the Wav2Vec2 internal
+  # SpecAugment masker never sees a sequence_length below
+  # ``mask_time_length`` (=10).  See models/wav2vec2_trainer.py for
+  # the rationale.
+  min_train_audio_duration_sec: 1.0
+  min_collator_input_samples: 6400   # ≈ 0.40 s @ 16 kHz
+
   # Misc ---------------------------------------------------------------
   remove_unused_columns: false
   group_by_length: true
