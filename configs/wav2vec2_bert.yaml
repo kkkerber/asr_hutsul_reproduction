@@ -1,17 +1,3 @@
-# =====================================================================
-# Wav2Vec2-BERT-UK-v2.1 fine-tuning configuration
-# ---------------------------------------------------------------------
-# Consumed by ``models/wav2vec2_bert_trainer.py``.
-#
-#   python train.py --model_type wav2vec2_bert --variant w2v-bert-uk-v2.1
-#
-# The paper reports that *adapter* tuning outperforms LoRA on this
-# checkpoint.  The trainer therefore freezes the feature encoder and a
-# configurable number of lower transformer layers, leaving the
-# adapters and the CTC head trainable.  Augmentation is the "strong"
-# preset from ``utils.augmentation``.
-# =====================================================================
-
 defaults:
   sample_rate: 16000
 
@@ -42,20 +28,18 @@ defaults:
   early_stopping_threshold: 0.0
 
   # Adapter / freezing strategy ---------------------------------------
-  freeze_feature_encoder: true       # ``feature_projection`` + conv front-end
-  freeze_lower_transformer_layers: 6 # bottom-N encoder layers
-  train_adapters: true               # adapters & LM head only
+  freeze_feature_encoder: true
+  freeze_lower_transformer_layers: 6
+  train_adapters: true
   ctc_loss_reduction: mean
   ctc_zero_infinity: true
 
   # Augmentation policy ------------------------------------------------
   use_augmentation: true
-  augmentation_strong: true          # paper recommends stronger aug.
+  augmentation_strong: true
 
   # Audio-length safety (CTC) -----------------------------------------
   min_train_audio_duration_sec: 1.0
-  # Wav2Vec2-BERT consumes pre-extracted features, so the collator
-  # floor-pad on ``input_values`` is a no-op for this trainer.
   min_collator_input_samples: 0
 
   # Misc --------------------------------------------------------------
@@ -73,4 +57,4 @@ variants:
     max_steps: 5000
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 4   # effective batch 32
+    gradient_accumulation_steps: 4

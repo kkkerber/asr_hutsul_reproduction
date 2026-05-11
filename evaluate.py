@@ -1,46 +1,3 @@
-"""
-evaluate.py
-===========
-
-Standalone evaluation script.
-
-Loads a saved ASR checkpoint (any of the four supported families:
-Whisper, Wav2Vec2-XLSR, Wav2Vec2-BERT, OmniASR), runs inference on
-the dataset's test split and emits:
-
-* ``test_results.json``  — overall WER / CER + run metadata
-* ``predictions.csv``    — one row per test sample
-                              (reference, prediction, wer, cer)
-* ``error_analysis.json`` — top substitutions / insertions /
-                              deletions plus dialect-pair counts
-
-Auto-detection
---------------
-
-The model family is auto-detected by inspecting ``config.json``:
-
-* ``architectures = ["WhisperForConditionalGeneration"]``  → whisper
-* ``architectures = ["Wav2Vec2BertForCTC"]``               → wav2vec2_bert
-* ``architectures = ["Wav2Vec2ForCTC"]``                   → wav2vec2
-* anything else with ``model_type == "omniasr"``           → omniasr
-
-PEFT adapter checkpoints are detected by the presence of an
-``adapter_config.json``; the adapter is loaded on top of the base
-model declared in that JSON.
-
-Usage
------
-
-::
-
-    python evaluate.py --checkpoint outputs/whisper-small/final
-    python evaluate.py --checkpoint outputs/whisper-small/checkpoint-2000 \\
-                       --output_dir outputs/whisper-small/eval
-
-CLI arguments mirror those of ``train.py`` so dataset/column overrides
-remain consistent.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -54,15 +11,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Make the project importable regardless of cwd.
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
+import numpy as np
+import torch
 
-from config import (  # noqa: E402
+from config import (
     DEFAULT_DATASET_NAME,
     DEFAULT_SEED,
     ProjectConfig,
@@ -70,19 +26,14 @@ from config import (  # noqa: E402
     resolve_storage_layout,
     set_global_seed,
 )
-from metrics import (  # noqa: E402
+from metrics import (
     MetricCalculator,
     analyze_substitutions,
 )
-from preprocess import load_and_prepare  # noqa: E402
-from utils.text_normalization import build_default_normalizer  # noqa: E402
+from preprocess import load_and_prepare
+from utils.text_normalization import build_default_normalizer
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Model-family auto-detection
-# ---------------------------------------------------------------------------
 
 
 WHISPER_ARCHITECTURES = {
@@ -103,7 +54,7 @@ def _read_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         logger.warning("Could not read %s: %s", path, exc)
         return None
 
@@ -113,14 +64,6 @@ def detect_model_family(
     *,
     explicit: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Return ``(family, config_data)``.
-
-    ``family`` ∈ {"whisper", "wav2vec2", "wav2vec2_bert", "omniasr"}.
-
-    For PEFT adapter checkpoints we look up the base model id in
-    ``adapter_config.json["base_model_name_or_path"]`` and download
-    the base config from the Hub on demand.
-    """
     if explicit:
         return explicit, {}
 
@@ -130,7 +73,7 @@ def detect_model_family(
     if config_path.exists():
         cfg = _read_json_if_exists(config_path) or {}
     elif adapter_config_path.exists():
-        # PEFT-only directory; the model_type lives on the base model.
+
         adapter_cfg = _read_json_if_exists(adapter_config_path) or {}
         base_id = adapter_cfg.get("base_model_name_or_path")
         if not base_id:
@@ -173,11 +116,8 @@ def detect_model_family(
 # Model loading
 # ---------------------------------------------------------------------------
 
-
 @dataclass
 class LoadedModel:
-    """Bundle returned by :func:`load_model_and_processor`."""
-
     family: str
     model: torch.nn.Module
     processor: Any
@@ -200,12 +140,7 @@ def load_model_and_processor(
     hf_token: Optional[str] = None,
     trust_remote_code: bool = False,
 ) -> LoadedModel:
-    """Load model + processor for any supported family.
 
-    ``device`` defaults to CUDA if available, otherwise CPU.
-    ``torch_dtype`` defaults to ``float16`` on CUDA and ``float32``
-    otherwise.
-    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch_dtype is None:
@@ -256,17 +191,12 @@ def load_model_and_processor(
             hf_token=hf_token,
             trust_remote_code=trust_remote_code,
         )
-    else:  # pragma: no cover
+    else:
         raise ValueError(f"Unknown model family: {family}")
 
     loaded.model = loaded.model.to(device)
     loaded.model.eval()
     return loaded
-
-
-# ---------------------------------------------------------------------------
-# Family-specific loaders
-# ---------------------------------------------------------------------------
 
 
 def _load_whisper(
@@ -303,8 +233,7 @@ def _load_whisper(
             token=hf_token,
             trust_remote_code=trust_remote_code,
         )
-        # Some users save the processor next to the adapter — prefer
-        # that over the base if it exists.
+
         if (checkpoint_dir / "preprocessor_config.json").exists():
             try:
                 processor = WhisperProcessor.from_pretrained(
@@ -314,7 +243,7 @@ def _load_whisper(
                     token=hf_token,
                     trust_remote_code=trust_remote_code,
                 )
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 logger.warning(
                     "Could not load processor from adapter dir (%s); "
                     "falling back to base model processor.",
@@ -327,18 +256,14 @@ def _load_whisper(
             token=hf_token,
             trust_remote_code=trust_remote_code,
         )
-        # ``PeftModel.from_pretrained`` does not accept ``torch_dtype``
-        # — the dtype is inherited from ``base_model``, which we
-        # already loaded with the correct dtype above.
+
         model = PeftModel.from_pretrained(
             base_model, str(checkpoint_dir)
         )
-        # Merging the adapter into the base weights makes generation
-        # ~30% faster and avoids PEFT's wrapper interfering with
-        # ``model.generate``'s special-token handling.
+
         try:
             model = model.merge_and_unload()
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             logger.warning(
                 "Could not merge LoRA adapters (%s); using PeftModel "
                 "directly for inference.",
@@ -359,7 +284,6 @@ def _load_whisper(
             trust_remote_code=trust_remote_code,
         )
 
-    # Ensure modern generation behaviour.
     if model.generation_config is None:
         from transformers import GenerationConfig
 
@@ -373,7 +297,7 @@ def _load_whisper(
     model.generation_config.suppress_tokens = []
     model.config.forced_decoder_ids = None
     model.config.suppress_tokens = []
-    model.config.use_cache = True  # generation needs the KV cache
+    model.config.use_cache = True
 
     return LoadedModel(
         family="whisper",
@@ -447,7 +371,6 @@ def _load_wav2vec2_bert(
         trust_remote_code=trust_remote_code,
     )
 
-    # Reuse the lightweight wrapper from the trainer module.
     from models.wav2vec2_bert_trainer import W2VBertProcessor
 
     processor = W2VBertProcessor(
@@ -477,8 +400,6 @@ def _load_omniasr(
         AutoTokenizer,
     )
 
-    # OmniASR ships custom modeling code, so trust_remote_code is
-    # forced on regardless of the CLI flag.
     feature_extractor = AutoFeatureExtractor.from_pretrained(
         str(checkpoint_dir),
         token=hf_token,
@@ -512,11 +433,6 @@ def _load_omniasr(
     )
 
 
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class InferenceConfig:
     batch_size: int = 8
@@ -535,8 +451,6 @@ def _build_input_batch(
     audio_list: List[np.ndarray],
     sample_rate: int,
 ) -> Dict[str, torch.Tensor]:
-    """Run the feature extractor on a list of waveforms and return a
-    padded torch tensor batch."""
     batch = feature_extractor(
         audio_list,
         sampling_rate=sample_rate,
@@ -563,11 +477,7 @@ def run_inference(
     cfg: InferenceConfig,
     device: torch.device,
 ) -> Tuple[List[str], List[str]]:
-    """Iterate over ``dataset_split`` and return ``(predictions, references)``.
-
-    Both lists are post-text-normalised so they are directly
-    comparable for WER/CER.
-    """
+    """Return ``(predictions, references)``, both text-normalised."""
     normalizer = build_default_normalizer()
 
     predictions: List[str] = []
@@ -619,7 +529,6 @@ def run_inference(
                         pred_ids, skip_special_tokens=True
                     )
                 else:
-                    # CTC path — single forward pass, argmax over vocab.
                     outputs = loaded.model(**batch)
                     logits = outputs.logits  # (B, T, V)
                     pred_ids = logits.argmax(dim=-1)
@@ -633,11 +542,6 @@ def run_inference(
             references.append(normalizer(ref))
 
     return predictions, references
-
-
-# ---------------------------------------------------------------------------
-# Output writers
-# ---------------------------------------------------------------------------
 
 
 def write_predictions_csv(
@@ -672,11 +576,6 @@ def write_results_json(
     with open(output_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, ensure_ascii=False)
     logger.info("Wrote summary to %s", output_path)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -721,7 +620,6 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Override the canonical storage root.",
     )
 
-    # Dataset
     parser.add_argument("--dataset_name", default=DEFAULT_DATASET_NAME)
     parser.add_argument("--dataset_config", default=None)
     parser.add_argument("--audio_column", default=None)
@@ -730,11 +628,9 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--split",
         default="test",
         choices=["train", "validation", "test"],
-        help="Which split to evaluate on.",
     )
     parser.add_argument("--max_samples", type=int, default=None)
 
-    # Inference
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_new_tokens", type=int, default=225)
     parser.add_argument("--num_beams", type=int, default=1)
@@ -748,7 +644,6 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
 
-    # External
     parser.add_argument("--hf_token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--trust_remote_code", action="store_true")
     return parser
@@ -770,11 +665,6 @@ def _parse_device(name: Optional[str]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 def main(argv: Optional[List[str]] = None) -> int:
     configure_logging()
     args = _build_argparser().parse_args(argv)
@@ -790,12 +680,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     layout.ensure()
 
-    # Per-run identifier for the layout's evaluations/* subdirectories.
     run_name = args.run_name or checkpoint_dir.resolve().name or "run"
 
     if args.output_dir:
-        # Legacy single-folder mode — caller wants everything in one
-        # directory.  The three artefacts go side-by-side.
         legacy_dir = Path(args.output_dir)
         legacy_dir.mkdir(parents=True, exist_ok=True)
         csv_dir = legacy_dir
@@ -811,7 +698,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     device = _parse_device(args.device)
     torch_dtype = _parse_dtype(args.torch_dtype)
 
-    # ---- Load model + processor ----------------------------------------
     loaded = load_model_and_processor(
         checkpoint_dir,
         model_family=args.model_type,
@@ -821,15 +707,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         trust_remote_code=args.trust_remote_code,
     )
 
-    # ---- Load dataset (raw, not pre-featurised) ------------------------
     project_cfg = ProjectConfig(
         dataset_name=args.dataset_name,
         dataset_config=args.dataset_config,
         audio_column=args.audio_column,
         text_column=args.text_column,
         seed=args.seed,
-        # Read from the same shared preprocessing root the trainers
-        # populated, so evaluate.py reuses the cached split.
         preprocessed_dir=layout.preprocessed_dir("shared"),
         dataset_cache_dir=layout.datasets_cache,
         cache_dir=layout.cache,
@@ -859,7 +742,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         text_col,
     )
 
-    # ---- Run inference --------------------------------------------------
     inference_cfg = InferenceConfig(
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
@@ -879,7 +761,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         device=device,
     )
 
-    # ---- Metrics --------------------------------------------------------
     metric_calculator = MetricCalculator()
     overall_wer = metric_calculator.compute_wer(predictions, references)
     overall_cer = metric_calculator.compute_cer(predictions, references)
@@ -892,7 +773,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         len(predictions),
     )
 
-    # ---- Persist outputs -----------------------------------------------
     csv_path = csv_dir / "predictions.csv"
     write_predictions_csv(
         csv_path,
@@ -925,8 +805,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     write_results_json(json_dir / "test_results.json", results_payload)
     error_report.to_json(json_dir / "error_analysis.json", top_k=50)
 
-    # Plain-text dump of decoded predictions (one per line) for quick
-    # ``cat | less`` inspection without a CSV reader.
     pred_dump_path = predictions_dir / "predictions.txt"
     pred_dump_path.parent.mkdir(parents=True, exist_ok=True)
     with open(pred_dump_path, "w", encoding="utf-8") as fh:

@@ -1,40 +1,3 @@
-"""
-preprocess.py
-=============
-
-Dataset loading and preprocessing for the Hutsul ASR reproduction.
-
-Responsibilities
-----------------
-
-1. Load ``KSE-RESEARCH-Group/Dido-Yvanchyk-Audio-Dataset-v2`` (or any
-   compatible HF dataset) via :func:`datasets.load_dataset`.
-2. Auto-detect the audio and transcription columns (the upstream
-   dataset has been renamed several times; we accept any of the
-   candidates listed in :data:`config.AUDIO_COLUMN_CANDIDATES` /
-   :data:`config.TEXT_COLUMN_CANDIDATES`).
-3. Resample audio to 16 kHz via the modern ``Audio`` feature.
-4. Apply project text normalisation.
-5. Split into 80/10/10 train/validation/test (deterministically).
-6. Cache the prepared :class:`datasets.DatasetDict` to disk so
-   subsequent runs skip the heavy work.
-
-Also exposed:
-
-* :func:`prepare_for_model` — one-shot helper that does all of the
-  above *and* runs the supplied feature-extractor / tokenizer to
-  emit ``input_features`` (or ``input_values``) and ``labels`` ready
-  for the Trainer.
-
-CLI usage
----------
-
-::
-
-    python preprocess.py --dataset_name KSE-RESEARCH-Group/Dido-Yvanchyk-Audio-Dataset-v2 \\
-                        --output_dir .cache/preprocessed
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -72,15 +35,9 @@ from utils.text_normalization import TextNormalizer, build_default_normalizer
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Column detection
-# ---------------------------------------------------------------------------
-
-
 def detect_audio_column(
     columns: List[str], explicit: Optional[str] = None
 ) -> str:
-    """Return the audio column name from ``columns``."""
     if explicit:
         if explicit not in columns:
             raise KeyError(
@@ -103,7 +60,6 @@ def detect_audio_column(
 def detect_text_column(
     columns: List[str], explicit: Optional[str] = None
 ) -> str:
-    """Return the text/transcription column name from ``columns``."""
     if explicit:
         if explicit not in columns:
             raise KeyError(
@@ -123,11 +79,6 @@ def detect_text_column(
     )
 
 
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
-
 def load_raw_dataset(
     *,
     dataset_name: str = DEFAULT_DATASET_NAME,
@@ -137,12 +88,6 @@ def load_raw_dataset(
     token: Optional[str] = None,
     trust_remote_code: bool = False,
 ) -> Union[DatasetDict, Dataset]:
-    """Load the dataset from the Hugging Face Hub.
-
-    The function accepts both gated (``token=…``) and public datasets
-    and forwards the remaining arguments verbatim to
-    :func:`datasets.load_dataset`.
-    """
     logger.info("Loading dataset %s (config=%s)…", dataset_name, dataset_config)
     ds = load_dataset(
         dataset_name,
@@ -160,11 +105,6 @@ def load_raw_dataset(
     return ds
 
 
-# ---------------------------------------------------------------------------
-# Splitting
-# ---------------------------------------------------------------------------
-
-
 def split_dataset(
     ds: Union[Dataset, DatasetDict],
     *,
@@ -173,12 +113,7 @@ def split_dataset(
     test_ratio: float = DEFAULT_TEST_RATIO,
     seed: int = DEFAULT_SEED,
 ) -> DatasetDict:
-    """Return an 80/10/10 :class:`DatasetDict`.
 
-    If ``ds`` already has the three canonical splits we pass it through
-    unchanged.  Otherwise we concatenate any existing splits and
-    re-split deterministically using the given seed.
-    """
     total = train_ratio + val_ratio + test_ratio
     if abs(total - 1.0) > 1e-6:
         raise ValueError(
@@ -194,7 +129,6 @@ def split_dataset(
                 {k: ds[k] for k in ("train", "validation", "test")}
             )
 
-        # Concatenate every available split into one before re-splitting.
         from datasets import concatenate_datasets
 
         logger.info(
@@ -210,7 +144,7 @@ def split_dataset(
             f"Dataset has only {n} rows — cannot meaningfully split."
         )
 
-    # Two-step split: train vs. (val+test), then val vs. test.
+
     first_split = ds.train_test_split(
         test_size=val_ratio + test_ratio,
         seed=seed,
@@ -239,27 +173,11 @@ def split_dataset(
     )
     return out
 
-
-# ---------------------------------------------------------------------------
-# Audio-duration diagnostics + filter (CTC trainers only)
-# ---------------------------------------------------------------------------
-
-
 def compute_duration_diagnostics(
     ds: Union[Dataset, DatasetDict],
     audio_column: str,
     sample_rate: int = TARGET_SAMPLE_RATE,
 ) -> Dict[str, Any]:
-    """Return a dict of duration statistics for ``ds``.
-
-    Cheap when the audio column is the HF ``Audio`` feature: we read
-    the cached length-in-samples from each example without decoding
-    the waveform.  When that column is unavailable we fall back to
-    decoding the array (slower; only triggered for non-cast datasets).
-
-    The returned dict is suitable for direct ``logger.info`` printing
-    and for cross-run comparisons (it is JSON-serialisable).
-    """
     splits = ds.keys() if isinstance(ds, DatasetDict) else ("__single__",)
     out: Dict[str, Any] = {}
     for name in splits:
@@ -267,14 +185,11 @@ def compute_duration_diagnostics(
         durations: List[float] = []
         for example in split_ds:
             audio = example[audio_column]
-            # The HF ``Audio`` feature decodes lazily into ``array`` —
-            # ``len(array)`` is the sample count after resampling.
             if isinstance(audio, dict) and "array" in audio:
                 arr = audio["array"]
                 sr = int(audio.get("sampling_rate", sample_rate))
                 durations.append(len(arr) / sr)
             else:
-                # Path-only column; we cannot measure cheaply.
                 durations.append(float("nan"))
 
         arr = np.asarray(
@@ -311,7 +226,6 @@ def _log_duration_diagnostics(
     *,
     threshold_sec: Optional[float] = None,
 ) -> None:
-    """Pretty-print the diagnostic dict at INFO level."""
     logger.info("--- Audio-duration diagnostics ---")
     for split, s in diag.items():
         if s.get("count", 0) == 0 or s.get("min_sec") is None:
@@ -363,17 +277,6 @@ def filter_short_audio(
     splits: Optional[Tuple[str, ...]] = None,
     num_proc: Optional[int] = None,
 ) -> DatasetDict:
-    """Drop samples whose waveform is shorter than ``min_duration_sec``.
-
-    Parameters
-    ----------
-    splits
-        Which split names to apply the filter to.  ``None`` (the
-        default) applies to every split — appropriate for CTC training
-        where short clips also break encoder-time masking at
-        evaluation time, and where the test split should mirror the
-        train distribution.
-    """
     if min_duration_sec is None or min_duration_sec <= 0:
         return ds
 
@@ -386,8 +289,7 @@ def filter_short_audio(
             return False
         if isinstance(audio, dict) and "array" in audio:
             return len(audio["array"]) >= min_samples
-        # Cannot evaluate length without decoding — be conservative
-        # and KEEP (the collator's safety pad acts as a backstop).
+
         return True
 
     new_splits: Dict[str, Dataset] = {}
@@ -415,11 +317,6 @@ def filter_short_audio(
     return DatasetDict(new_splits)
 
 
-# ---------------------------------------------------------------------------
-# Normalisation pass over a DatasetDict
-# ---------------------------------------------------------------------------
-
-
 def normalize_dataset(
     ds: DatasetDict,
     *,
@@ -430,12 +327,8 @@ def normalize_dataset(
     drop_empty: bool = True,
     num_proc: Optional[int] = None,
 ) -> DatasetDict:
-    """Resample audio + normalise transcripts in-place."""
     normalizer = normalizer or build_default_normalizer()
 
-    # Cast the audio column.  ``cast_column`` rebinds the column to the
-    # ``Audio`` feature so ``ds[i][audio_column]`` returns
-    # ``{"array": np.ndarray, "sampling_rate": int, ...}``.
     for split in ds:
         if audio_column not in ds[split].column_names:
             raise KeyError(
@@ -450,7 +343,6 @@ def normalize_dataset(
         )
 
     def _normalize_text_row(batch: Dict[str, Any]) -> Dict[str, Any]:
-        # ``map`` with ``batched=True`` gives us a column-of-lists dict.
         batch[text_column] = [normalizer(t) for t in batch[text_column]]
         return batch
 
@@ -484,11 +376,6 @@ def normalize_dataset(
     return ds
 
 
-# ---------------------------------------------------------------------------
-# End-to-end loader
-# ---------------------------------------------------------------------------
-
-
 def load_and_prepare(
     config: Optional[ProjectConfig] = None,
     *,
@@ -503,33 +390,11 @@ def load_and_prepare(
     trust_remote_code: bool = False,
     num_proc: Optional[int] = None,
 ) -> Tuple[DatasetDict, str, str]:
-    """Load → split → normalise → cache.
-
-    Returns
-    -------
-    dataset
-        A :class:`DatasetDict` with ``train`` / ``validation`` /
-        ``test`` splits.
-    audio_column
-        Resolved audio column name.
-    text_column
-        Resolved text column name.
-    """
     cfg = config or ProjectConfig()
     cfg.ensure_dirs()
 
     dataset_name = dataset_name or cfg.dataset_name
 
-    # ---- Cache path ------------------------------------------------------
-    # Priority order:
-    #   1. explicit ``cache_dir`` argument
-    #   2. ``cfg.preprocessed_dir`` (typically points at
-    #      ``<storage_root>/preprocessed/<model_type>/`` under Colab)
-    #   3. fallback to the layout-resolved preprocessed root
-    #
-    # The cache path is fingerprinted with the active duration filter
-    # so an old, unfiltered cache cannot be silently reused after the
-    # filter is enabled.
     cache_root = (
         Path(cache_dir)
         if cache_dir is not None
@@ -557,7 +422,6 @@ def load_and_prepare(
                 "Failed to load preprocessed cache (%s) — regenerating", exc
             )
 
-    # ---- Load + split + normalise ---------------------------------------
     raw = load_raw_dataset(
         dataset_name=dataset_name,
         dataset_config=dataset_config or cfg.dataset_config,
@@ -566,7 +430,6 @@ def load_and_prepare(
         trust_remote_code=trust_remote_code,
     )
 
-    # Determine columns from the first available split.
     first_split = (
         raw if isinstance(raw, Dataset) else raw[next(iter(raw.keys()))]
     )
@@ -591,12 +454,6 @@ def load_and_prepare(
         num_proc=num_proc,
     )
 
-    # ---- Optional duration diagnostic + filter --------------------------
-    # The diagnostic always runs when a filter is configured so the
-    # operator sees how many samples will be removed and why.  It is
-    # intentionally a no-op when ``min_train_audio_duration_sec`` is
-    # None (the Whisper case) — Whisper pads internally to 30 s and
-    # tolerates arbitrarily short clips.
     if cfg.min_train_audio_duration_sec:
         try:
             diag = compute_duration_diagnostics(
@@ -605,10 +462,9 @@ def load_and_prepare(
             _log_duration_diagnostics(
                 diag, threshold_sec=cfg.min_train_audio_duration_sec
             )
-        except Exception as exc:  # pragma: no cover — diagnostic must never crash training
+        except Exception as exc:
             logger.warning(
-                "Duration diagnostic failed (%s); proceeding with filter "
-                "anyway.",
+                "Duration diagnostic failed (%s); proceeding with filter.",
                 exc,
             )
 
@@ -619,31 +475,22 @@ def load_and_prepare(
             sample_rate=cfg.sample_rate,
             num_proc=num_proc,
         )
-        # Sanity: we MUST have at least one row in train after filtering.
         if "train" in ds and len(ds["train"]) == 0:
             raise RuntimeError(
                 f"Duration filter at {cfg.min_train_audio_duration_sec}s "
-                "removed every training sample.  Lower the threshold or "
-                "verify that your dataset's audio column was decoded "
-                "correctly."
+                "removed every training sample."
             )
 
-    # ---- Persist cache --------------------------------------------------
     if use_disk_cache:
         try:
             ds.save_to_disk(str(cache_path))
             logger.info("Saved preprocessed dataset to %s", cache_path)
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             logger.warning(
                 "Failed to save preprocessed cache to %s: %s", cache_path, exc
             )
 
     return ds, ac, tc
-
-
-# ---------------------------------------------------------------------------
-# Per-model feature extraction
-# ---------------------------------------------------------------------------
 
 
 def prepare_for_model(
@@ -661,18 +508,7 @@ def prepare_for_model(
     feature_kwargs: Optional[Dict[str, Any]] = None,
     tokenizer_kwargs: Optional[Dict[str, Any]] = None,
 ) -> DatasetDict:
-    """Run ``feature_extractor`` and ``tokenizer`` over every split.
 
-    The result has two columns per row: ``input_features`` (or
-    ``input_values`` — whichever the feature extractor returns) and
-    ``labels``.
-
-    Parameters
-    ----------
-    waveform_augmenter
-        Optional callable applied to the raw waveform before feature
-        extraction.  Only fires for splits listed in ``augment_splits``.
-    """
     feature_kwargs = dict(feature_kwargs or {})
     tokenizer_kwargs = dict(tokenizer_kwargs or {})
 
@@ -687,7 +523,7 @@ def prepare_for_model(
             if do_augment:
                 try:
                     samples = waveform_augmenter(samples, sr)
-                except Exception as exc:  # pragma: no cover
+                except Exception as exc:
                     logger.warning(
                         "Waveform augmentation failed (%s) — using original audio",
                         exc,
@@ -699,8 +535,6 @@ def prepare_for_model(
                 **feature_kwargs,
             )
 
-            # The feature extractor returns a ``BatchFeature`` with
-            # one or both of ``input_features`` / ``input_values``.
             out: Dict[str, Any] = {}
             if "input_features" in features:
                 out["input_features"] = features["input_features"][0]
@@ -774,7 +608,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def main() -> None:  # pragma: no cover — CLI entry-point
+def main() -> None:
     configure_logging()
     args = _build_argparser().parse_args()
 
@@ -818,5 +652,5 @@ def main() -> None:  # pragma: no cover — CLI entry-point
     )
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

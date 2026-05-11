@@ -1,29 +1,8 @@
-"""
-utils/augmentation.py
-=====================
+"""On-the-fly augmentation.
 
-Optional on-the-fly data augmentation for ASR training.
-
-Two complementary augmentation stages are implemented:
-
-1. **Waveform augmentation** (:class:`WaveformAugmenter`) — applied
-   *before* feature extraction, on raw 16-kHz mono audio.  Powered by
-   the ``audiomentations`` library:
-
-   * Gaussian noise injection,
-   * pitch shifting (semitones),
-   * speed / time stretching (0.8×–1.2×),
-   * gain modulation (dB).
-
-2. **Feature-level augmentation** (:class:`SpecAugment`) — applied
-   *after* feature extraction, directly on log-mel / fbank tensors.
-   This is a faithful reimplementation of Park et al. (2019)
-   SpecAugment with independent time and frequency masking.
-
-The :func:`build_augmentation_pipeline` factory returns the appropriate
-augmenter for a given model family and respects the project
-``ProjectConfig.use_augmentation`` flag (or the equivalent
-``--use_augmentation`` CLI flag).
+WaveformAugmenter: audiomentations (noise / pitch / time-stretch / gain),
+applied before feature extraction.
+SpecAugment: time + frequency masking on the padded log-mel tensor.
 """
 
 from __future__ import annotations
@@ -37,15 +16,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Optional dependency: audiomentations
-# ---------------------------------------------------------------------------
-#
-# ``audiomentations`` is listed in ``requirements.txt``, but we still
-# guard the import — the module is importable on machines that have not
-# installed the optional dep, and only fails when the user actually
-# enables augmentation.
-
+# audiomentations is optional — only required when augmentation is enabled.
 try:
     from audiomentations import (
         AddGaussianNoise,
@@ -61,69 +32,43 @@ except ImportError:  # pragma: no cover
     AddGaussianNoise = Compose = Gain = PitchShift = TimeStretch = None  # type: ignore
 
 
-# ---------------------------------------------------------------------------
-# Waveform augmentation
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class WaveformAugmentConfig:
-    """Hyper-parameters for :class:`WaveformAugmenter`.
-
-    Defaults are conservative — strong enough to regularise but mild
-    enough that they do not destroy phonetic content for Hutsul vowel
-    pairs (which are sensitive to pitch and formant shifts).
-    """
+    """Conservative defaults — mild enough not to break Hutsul vowels."""
 
     sample_rate: int = 16_000
 
-    # Gaussian noise
     p_noise: float = 0.5
     min_amplitude: float = 0.0005
     max_amplitude: float = 0.015
 
-    # Pitch shift (semitones)
     p_pitch: float = 0.4
     min_semitones: float = -2.0
     max_semitones: float = 2.0
 
-    # Time stretch (speed perturbation, 0.8x–1.2x)
+    # 0.8x–1.2x speed perturbation
     p_time: float = 0.4
     min_rate: float = 0.8
     max_rate: float = 1.2
 
-    # Gain modulation (dB)
     p_gain: float = 0.4
     min_gain_db: float = -6.0
     max_gain_db: float = 6.0
 
 
 class WaveformAugmenter:
-    """Composable waveform augmenter built on ``audiomentations``.
-
-    The object is callable: ``augmenter(samples, sample_rate)`` returns
-    an augmented ``np.ndarray`` of the same dtype.  Both arguments
-    mirror the audiomentations call convention so that the augmenter
-    can be slotted into any preprocessing pipeline that already uses
-    that library.
-    """
+    """audiomentations Compose: noise / pitch / time-stretch / gain."""
 
     def __init__(self, config: Optional[WaveformAugmentConfig] = None) -> None:
         if not _AUDIOMENTATIONS_AVAILABLE:
             raise ImportError(
-                "WaveformAugmenter requires the optional package "
-                "'audiomentations'.  Install it via: pip install audiomentations"
+                "WaveformAugmenter requires audiomentations. "
+                "pip install audiomentations"
             )
 
         self.config = config or WaveformAugmentConfig()
 
-        # ``Compose`` runs each transform with the configured per-call
-        # probability.  audiomentations >= 0.34 dropped the
-        # ``leave_length_unchanged`` parameter on ``TimeStretch`` —
-        # the audio length always changes now, which is what we want
-        # for speed perturbation anyway.  We only pass kwargs that
-        # exist across all supported versions (>= 0.36 per
-        # requirements.txt).
+        # audiomentations >= 0.34 removed TimeStretch.leave_length_unchanged.
         self._pipeline = Compose(
             [
                 AddGaussianNoise(
@@ -171,54 +116,33 @@ class WaveformAugmenter:
             return samples
 
 
-# ---------------------------------------------------------------------------
-# SpecAugment (feature-level)
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class SpecAugmentConfig:
-    """Hyper-parameters for :class:`SpecAugment`.
+    """Park et al. (2019) "LibriSpeech basic", scaled for Hutsul."""
 
-    Defaults follow the "LibriSpeech basic" policy from Park et al.,
-    scaled down slightly for the much smaller Hutsul corpus.
-    """
-
-    # Time masking
     time_mask_param: int = 40
     n_time_masks: int = 2
-    time_mask_p: float = 1.0  # cap on fraction of total length
+    time_mask_p: float = 1.0
 
-    # Frequency masking
     freq_mask_param: int = 27
     n_freq_masks: int = 2
 
-    # Probabilities (per call)
     apply_prob: float = 0.8
 
-    # Mask fill value.  ``None`` -> mean of the input tensor.
+    # None -> mean of the input tensor
     mask_value: Optional[float] = None
 
 
 class SpecAugment:
-    """Feature-domain SpecAugment.
-
-    The transform operates on a tensor of shape ``(..., n_mels, n_frames)``
-    (the layout produced by all four model families' feature extractors
-    once converted to ``torch.Tensor``).  Numpy arrays are accepted as
-    well — the type is preserved on output.
-    """
+    """Time + frequency masking on shape ``(..., n_mels, n_frames)``."""
 
     def __init__(self, config: Optional[SpecAugmentConfig] = None) -> None:
         self.config = config or SpecAugmentConfig()
 
-    # ------------------------------------------------------------------
     def __call__(self, features: Any) -> Any:
         if random.random() > self.config.apply_prob:
             return features
 
-        # Lazy import torch so that this module can be imported in
-        # environments where torch is missing (e.g. CI lint).
         try:
             import torch  # noqa: WPS433
 
@@ -229,7 +153,6 @@ class SpecAugment:
 
         return self._apply_numpy(np.asarray(features))
 
-    # ------------------------------------------------------------------
     def _apply_numpy(self, x: np.ndarray) -> np.ndarray:
         if x.ndim < 2:
             raise ValueError(
@@ -244,7 +167,6 @@ class SpecAugment:
             else float(self.config.mask_value)
         )
 
-        # Time masks
         max_time = int(min(self.config.time_mask_param,
                            max(1, int(n_frames * self.config.time_mask_p))))
         for _ in range(self.config.n_time_masks):
@@ -254,7 +176,6 @@ class SpecAugment:
             t0 = random.randint(0, n_frames - t)
             out[..., :, t0 : t0 + t] = fill
 
-        # Frequency masks
         for _ in range(self.config.n_freq_masks):
             f = random.randint(0, min(self.config.freq_mask_param, n_mels))
             if f == 0 or f >= n_mels:
@@ -264,9 +185,8 @@ class SpecAugment:
 
         return out
 
-    # ------------------------------------------------------------------
-    def _apply_torch(self, x: "Any") -> "Any":  # noqa: F821 — runtime-only torch
-        import torch  # local import
+    def _apply_torch(self, x: "Any") -> "Any":  # noqa: F821
+        import torch
 
         if x.dim() < 2:
             raise ValueError(
@@ -282,7 +202,6 @@ class SpecAugment:
             else float(self.config.mask_value)
         )
 
-        # Time masks
         max_time = int(min(self.config.time_mask_param,
                            max(1, int(n_frames * self.config.time_mask_p))))
         for _ in range(self.config.n_time_masks):
@@ -292,7 +211,6 @@ class SpecAugment:
             t0 = torch.randint(0, n_frames - t + 1, (1,)).item()
             out[..., :, t0 : t0 + t] = fill
 
-        # Frequency masks
         for _ in range(self.config.n_freq_masks):
             f = torch.randint(
                 0, min(self.config.freq_mask_param, n_mels) + 1, (1,)
@@ -305,24 +223,13 @@ class SpecAugment:
         return out
 
 
-# ---------------------------------------------------------------------------
-# Combined pipeline
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class AugmentationPipeline:
-    """Bundles a waveform augmenter and a SpecAugment instance.
-
-    Either component is optional — set the corresponding field to
-    ``None`` to disable it.  This is the structure consumed by every
-    Trainer in ``models/``.
-    """
+    """Waveform + SpecAugment bundle. Either field can be ``None``."""
 
     waveform: Optional[WaveformAugmenter] = None
     specaugment: Optional[SpecAugment] = None
 
-    # ------------------------------------------------------------------
     def apply_waveform(
         self, samples: np.ndarray, sample_rate: int
     ) -> np.ndarray:
@@ -330,21 +237,14 @@ class AugmentationPipeline:
             return samples
         return self.waveform(samples, sample_rate)
 
-    # ------------------------------------------------------------------
     def apply_features(self, features: Any) -> Any:
         if self.specaugment is None:
             return features
         return self.specaugment(features)
 
-    # ------------------------------------------------------------------
     @property
     def enabled(self) -> bool:
         return self.waveform is not None or self.specaugment is not None
-
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
 
 
 def build_augmentation_pipeline(
@@ -357,24 +257,7 @@ def build_augmentation_pipeline(
     enable_specaugment: bool = True,
     strong: bool = False,
 ) -> AugmentationPipeline:
-    """Build a project-wide :class:`AugmentationPipeline`.
-
-    Parameters
-    ----------
-    use_augmentation
-        Master switch — if ``False`` returns an empty (no-op) pipeline.
-    sample_rate
-        Target audio sample rate; defaults to 16 kHz.
-    waveform_config / spec_config
-        Optional explicit overrides.  When omitted the defaults are
-        derived from ``strong``.
-    enable_waveform / enable_specaugment
-        Allow callers to turn off individual stages even when
-        ``use_augmentation=True``.
-    strong
-        Use the "strong" augmentation policy described in the paper for
-        Wav2Vec2-BERT (wider masks, higher noise, larger pitch range).
-    """
+    """``strong=True`` uses the W2V-BERT preset (wider masks, more noise)."""
 
     if not use_augmentation:
         return AugmentationPipeline(waveform=None, specaugment=None)
@@ -424,10 +307,6 @@ def build_augmentation_pipeline(
 
     return AugmentationPipeline(waveform=waveform_aug, specaugment=spec_aug)
 
-
-# ---------------------------------------------------------------------------
-# Public surface
-# ---------------------------------------------------------------------------
 
 __all__ = [
     "AugmentationPipeline",

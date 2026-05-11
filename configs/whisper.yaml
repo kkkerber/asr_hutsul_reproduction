@@ -1,28 +1,11 @@
-# =====================================================================
-# Whisper-family fine-tuning configuration
-# ---------------------------------------------------------------------
-# This file is consumed by ``models/whisper_trainer.py``.  Pick a
-# variant via the CLI:
-#
-#   python train.py --model_type whisper --variant whisper-small
-#   python train.py --model_type whisper --variant whisper-medium
-#   python train.py --model_type whisper --variant whisper-large-v3
-#   python train.py --model_type whisper --variant whisper-large-uk-2
-#
-# Hyper-parameters mirror those reported in the paper.  All four
-# variants use LoRA fine-tuning with target_modules=[q_proj, v_proj]
-# and CER as the metric for best-checkpoint selection.
-# =====================================================================
-
 defaults:
-  # Whisper expects 16-kHz mono.
   sample_rate: 16000
 
   # Generation / decoding -----------------------------------------------
-  language: uk            # Whisper accepts both "uk" and "ukrainian".
+  language: uk
   task: transcribe
   generation_max_length: 225
-  num_beams: 1            # greedy at training-time eval (faster, paper-style)
+  num_beams: 1
 
   # Training schedule ---------------------------------------------------
   optimizer: adamw_torch
@@ -59,13 +42,6 @@ defaults:
     lora_dropout: 0.05
     bias: none
     target_modules: [q_proj, v_proj]
-    # NOTE: ``task_type`` is intentionally NOT set for Whisper.
-    #
-    # Setting ``task_type: SEQ_2_SEQ_LM`` would make peft wrap the
-    # model in ``PeftModelForSeq2SeqLM``, whose forward() forwards
-    # ``input_ids=`` to the base model — a kwarg
-    # ``WhisperForConditionalGeneration.forward()`` rejects with
-    # ``TypeError``.  The trainer ignores any value placed here.
 
   # Misc ---------------------------------------------------------------
   remove_unused_columns: false
@@ -76,7 +52,6 @@ defaults:
 
 # ---------------------------------------------------------------------
 # Variants
-# ---------------------------------------------------------------------
 variants:
 
   whisper-small:
@@ -84,25 +59,25 @@ variants:
     max_steps: 8000
     per_device_train_batch_size: 4
     per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 4   # effective batch 16
+    gradient_accumulation_steps: 4
 
   whisper-medium:
     model_name_or_path: openai/whisper-medium
     max_steps: 8000
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 4   # effective batch 32
+    gradient_accumulation_steps: 4
 
   whisper-large-v3:
     model_name_or_path: openai/whisper-large-v3
     max_steps: 8000
     per_device_train_batch_size: 4
     per_device_eval_batch_size: 2
-    gradient_accumulation_steps: 4   # effective batch 16
+    gradient_accumulation_steps: 4
 
   whisper-large-uk-2:
     model_name_or_path: arampacha/whisper-large-uk-2
     max_steps: 4000
     per_device_train_batch_size: 4
     per_device_eval_batch_size: 2
-    gradient_accumulation_steps: 4   # effective batch 16
+    gradient_accumulation_steps: 4

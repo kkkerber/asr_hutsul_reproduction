@@ -1,54 +1,3 @@
-"""
-models/wav2vec2_bert_trainer.py
-===============================
-
-Wav2Vec2-BERT-UK-v2.1 fine-tuning entry point.
-
-Highlights
-----------
-
-* Loads the model with ``AutoModelForCTC.from_pretrained`` so that
-  whichever architecture the checkpoint declares
-  (``Wav2Vec2BertForCTC``) is correctly resolved without hard-coding
-  the class name.
-
-* Builds a Ukrainian CTC vocabulary identical to the one used by the
-  Wav2Vec2-XLSR trainer; the resulting tokenizer + the upstream
-  :class:`SeamlessM4TFeatureExtractor` are wrapped in an
-  :class:`AutoProcessor`-compatible
-  :class:`Wav2Vec2BertProcessor` for saving/loading.
-
-* Implements the **adapter-tuning** strategy reported in the paper:
-
-  1. Freeze the entire model.
-  2. Unfreeze every parameter whose qualified name contains
-     ``"adapter"`` (case-insensitive).  This catches:
-
-     * ``model.adapter.*`` (the projection adapter at the output of
-       the encoder, controlled by ``config.add_adapter``);
-     * any per-layer ``adapter_layer_norm`` / ``adapter_attn`` /
-       ``adapter_ffn`` modules introduced by the v2.1 checkpoint.
-
-  3. Unfreeze the CTC head (``model.lm_head``).
-  4. Optionally unfreeze the top-N transformer layers for stronger
-     fine-tuning when ``freeze_lower_transformer_layers`` is set.
-
-  This selective unfreeze keeps < ~5% of the parameters trainable
-  while still recovering the published WER ≈ 18.24% / CER ≈ 3.47%.
-
-* Uses the **strong** augmentation preset
-  (:func:`utils.augmentation.build_augmentation_pipeline` with
-  ``strong=True``).  Feature-level SpecAugment is *not* applied in
-  the collator for this model — the underlying
-  :class:`Wav2Vec2BertModel` already performs SpecAugment-style
-  masking internally during the forward pass via the
-  ``mask_time_prob`` / ``mask_feature_prob`` config knobs.
-
-* Modern Trainer wiring: ``eval_strategy``, ``processing_class``,
-  ``label_names=["labels"]``, fp16, gradient checkpointing with
-  ``use_reentrant=False``.
-"""
-
 from __future__ import annotations
 
 import json
@@ -94,45 +43,21 @@ from utils.collators import DataCollatorCTCWithPadding
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "wav2vec2_bert.yaml"
 
 
-# ---------------------------------------------------------------------------
-# Lightweight processor wrapper
-# ---------------------------------------------------------------------------
-
-
 class W2VBertProcessor:
-    """Minimal feature-extractor + tokenizer bundle.
-
-    Wav2Vec2-BERT does not currently ship a dedicated ``Processor``
-    class in transformers, so we mimic the small subset of the
-    :class:`Wav2Vec2Processor` API that the rest of the project
-    relies on:
-
-    * ``feature_extractor`` and ``tokenizer`` attributes;
-    * ``save_pretrained(directory)``;
-    * ``__call__`` is intentionally NOT implemented — the project
-      always goes through ``feature_extractor`` / ``tokenizer``
-      directly.
-    """
 
     def __init__(self, feature_extractor: Any, tokenizer: Any) -> None:
         self.feature_extractor = feature_extractor
         self.tokenizer = tokenizer
 
-    # ------------------------------------------------------------------
     def save_pretrained(self, directory: Union[str, Path]) -> None:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         self.feature_extractor.save_pretrained(str(directory))
         self.tokenizer.save_pretrained(str(directory))
 
-    # ------------------------------------------------------------------
     @classmethod
     def from_pretrained(
         cls,
@@ -143,11 +68,6 @@ class W2VBertProcessor:
         fe = AutoFeatureExtractor.from_pretrained(directory, **kwargs)
         tok = Wav2Vec2CTCTokenizer.from_pretrained(directory, **kwargs)
         return cls(feature_extractor=fe, tokenizer=tok)
-
-
-# ---------------------------------------------------------------------------
-# Args
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -165,7 +85,6 @@ class Wav2Vec2BertTrainArgs:
 
     sample_rate: int = 16000
 
-    # Schedule
     learning_rate: float = 5e-5
     max_steps: int = 5000
     warmup_steps: int = 800
@@ -174,41 +93,34 @@ class Wav2Vec2BertTrainArgs:
     max_grad_norm: float = 1.0
     optimizer: str = "adamw_torch"
 
-    # Batching
     per_device_train_batch_size: int = 8
     per_device_eval_batch_size: int = 4
     gradient_accumulation_steps: int = 4
 
-    # Cadence
     eval_steps: int = 500
     save_steps: int = 500
     logging_steps: int = 50
     save_total_limit: int = 3
 
-    # Mixed precision / memory
     fp16: bool = True
     bf16: bool = False
     gradient_checkpointing: bool = True
 
-    # Best-model selection
     metric_for_best_model: str = "cer"
     greater_is_better: bool = False
     load_best_model_at_end: bool = True
     early_stopping_patience: int = 5
     early_stopping_threshold: float = 0.0
 
-    # Adapter / freezing strategy
     freeze_feature_encoder: bool = True
     freeze_lower_transformer_layers: int = 6
     train_adapters: bool = True
     ctc_loss_reduction: str = "mean"
     ctc_zero_infinity: bool = True
 
-    # Augmentation
     use_augmentation: bool = True
     augmentation_strong: bool = True
 
-    # Misc
     seed: int = 42
     deterministic: bool = False
     dataloader_num_workers: int = 2
@@ -219,18 +131,8 @@ class Wav2Vec2BertTrainArgs:
     trust_remote_code: bool = False
     hf_token: Optional[str] = None
 
-    # Audio-length safety -------------------------------------------------
-    # See ``Wav2Vec2TrainArgs`` for the rationale.  Wav2Vec2-BERT
-    # consumes pre-extracted log-mel features, so the collator-level
-    # floor pad is a no-op for this trainer; the dataset filter is
-    # the only active safeguard.
     min_train_audio_duration_sec: float = 1.0
-    min_collator_input_samples: int = 0  # no-op for input_features path
-
-
-# ---------------------------------------------------------------------------
-# YAML loader
-# ---------------------------------------------------------------------------
+    min_collator_input_samples: int = 0
 
 
 def load_yaml_config(
@@ -260,14 +162,7 @@ def load_yaml_config(
     return merged
 
 
-# ---------------------------------------------------------------------------
-# Vocabulary / tokenizer
-# ---------------------------------------------------------------------------
-
-
 def build_vocab() -> Dict[str, int]:
-    """Identical to ``models.wav2vec2_trainer.build_vocab`` but kept
-    local so that the two trainers can be installed in isolation."""
     vocab: Dict[str, int] = {}
     for ch in UKRAINIAN_ALPHABET:
         vocab[ch] = len(vocab)
@@ -287,15 +182,9 @@ def write_vocab(vocab: Dict[str, int], output_dir: Path) -> Path:
     return path
 
 
-# ---------------------------------------------------------------------------
-# Processor / model builders
-# ---------------------------------------------------------------------------
-
-
 def build_processor(
     args: Wav2Vec2BertTrainArgs, run_dir: Path
 ) -> W2VBertProcessor:
-    """Build the (FE + tokenizer) pair for Wav2Vec2-BERT."""
     vocab = build_vocab()
     vocab_path = write_vocab(vocab, run_dir)
 
@@ -324,7 +213,6 @@ def build_model(
     args: Wav2Vec2BertTrainArgs,
     processor: W2VBertProcessor,
 ) -> torch.nn.Module:
-    """Load and (selectively) freeze the Wav2Vec2-BERT model."""
     model = AutoModelForCTC.from_pretrained(
         args.model_name_or_path,
         ctc_loss_reduction=args.ctc_loss_reduction,
@@ -340,8 +228,6 @@ def build_model(
         model.config.use_cache = False
 
     if args.freeze_feature_encoder:
-        # ``Wav2Vec2BertForCTC`` exposes ``freeze_feature_encoder``
-        # which freezes the feature_projection block.
         if hasattr(model, "freeze_feature_encoder"):
             model.freeze_feature_encoder()
 
@@ -356,42 +242,27 @@ def build_model(
     return model
 
 
-# ---------------------------------------------------------------------------
-# Adapter / selective-freeze strategy
-# ---------------------------------------------------------------------------
-
-
 def _apply_adapter_training_strategy(
     model: torch.nn.Module,
     *,
     freeze_lower_transformer_layers: int = 0,
 ) -> None:
-    """Freeze everything, then re-enable adapters + LM head + (optionally) top-N layers.
 
-    This implements the paper's adapter-tuning strategy.  The function
-    is intentionally name-based so that it stays robust against minor
-    structural changes between Wav2Vec2-BERT releases.
-    """
-
-    # 1) Freeze everything.
     for p in model.parameters():
         p.requires_grad = False
 
-    # 2) Unfreeze every adapter parameter.
     n_adapter = 0
     for name, p in model.named_parameters():
         if "adapter" in name.lower():
             p.requires_grad = True
             n_adapter += p.numel()
 
-    # 3) Unfreeze the CTC head.
     n_head = 0
     if hasattr(model, "lm_head"):
         for p in model.lm_head.parameters():
             p.requires_grad = True
             n_head += p.numel()
 
-    # 4) Optionally unfreeze the top-N transformer layers.
     n_top = 0
     encoder_layers = _find_encoder_layers(model)
     if encoder_layers is not None and freeze_lower_transformer_layers > 0:
@@ -420,11 +291,6 @@ def _apply_adapter_training_strategy(
 
 
 def _find_encoder_layers(model: torch.nn.Module) -> Optional[List[torch.nn.Module]]:
-    """Return the list of transformer layers, regardless of nesting.
-
-    Wav2Vec2-BERT exposes them under ``model.wav2vec2_bert.encoder.layers``;
-    older Wav2Vec2 backbones use ``model.wav2vec2.encoder.layers``.
-    """
     for attr in ("wav2vec2_bert", "wav2vec2", "model"):
         backbone = getattr(model, attr, None)
         if backbone is None:
@@ -448,11 +314,6 @@ def _log_trainable_parameters(model: torch.nn.Module) -> None:
         f"{total:,}",
         pct,
     )
-
-
-# ---------------------------------------------------------------------------
-# Dataset preparation
-# ---------------------------------------------------------------------------
 
 
 def _add_input_length_column(dataset: DatasetDict) -> DatasetDict:
@@ -492,7 +353,7 @@ def prepare_dataset(
         use_augmentation=args.use_augmentation,
         sample_rate=args.sample_rate,
         strong=args.augmentation_strong,
-        enable_specaugment=False,  # model has internal SpecAugment
+        enable_specaugment=False,
     )
     waveform_aug = (
         (lambda samples, sr: aug_pipeline.apply_waveform(samples, sr))
@@ -522,11 +383,6 @@ def prepare_dataset(
         prepared = _add_input_length_column(prepared)
 
     return prepared
-
-
-# ---------------------------------------------------------------------------
-# Training arguments
-# ---------------------------------------------------------------------------
 
 
 def build_training_args(
@@ -579,13 +435,7 @@ def build_training_args(
     )
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-
 def train_wav2vec2_bert(args: Wav2Vec2BertTrainArgs) -> Dict[str, float]:
-    """Run end-to-end Wav2Vec2-BERT-UK fine-tuning."""
     configure_logging()
     set_global_seed(args.seed, deterministic=args.deterministic)
 
@@ -620,14 +470,11 @@ def train_wav2vec2_bert(args: Wav2Vec2BertTrainArgs) -> Dict[str, float]:
     )
     project_cfg.ensure_dirs()
 
-    logger.info("=" * 70)
     logger.info("Wav2Vec2-BERT fine-tuning — variant=%s", args.variant)
     logger.info("Model:        %s", args.model_name_or_path)
     logger.info("Checkpoints:  %s", output_dir)
     logger.info("Final model:  %s", final_dir)
     logger.info("TensorBoard:  %s", tensorboard_dir)
-    logger.info("Storage root: %s", layout.root)
-    logger.info("=" * 70)
 
     processor = build_processor(args, output_dir)
     model = build_model(args, processor)
@@ -665,13 +512,6 @@ def train_wav2vec2_bert(args: Wav2Vec2BertTrainArgs) -> Dict[str, float]:
         eval_dataset=dataset["validation"],
         data_collator=collator,
         compute_metrics=compute_metrics,
-        # We pass the lightweight ``W2VBertProcessor`` wrapper rather
-        # than just the tokenizer so that the Trainer's per-checkpoint
-        # ``processing_class.save_pretrained(checkpoint_dir)`` call
-        # writes BOTH the FE config and the tokenizer files.  This is
-        # critical for resuming training from an intermediate
-        # checkpoint, and for ``evaluate.py`` to load a checkpoint-N
-        # directory directly.
         processing_class=processor,
         callbacks=callbacks,
     )
@@ -694,11 +534,6 @@ def train_wav2vec2_bert(args: Wav2Vec2BertTrainArgs) -> Dict[str, float]:
 
     logger.info("Training complete. Final eval metrics: %s", eval_metrics)
     return eval_metrics
-
-
-# ---------------------------------------------------------------------------
-# YAML -> args glue
-# ---------------------------------------------------------------------------
 
 
 def args_from_yaml(
@@ -724,10 +559,6 @@ def args_from_yaml(
             )
     return Wav2Vec2BertTrainArgs(**filtered)
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 __all__ = [
     "DEFAULT_CONFIG_PATH",

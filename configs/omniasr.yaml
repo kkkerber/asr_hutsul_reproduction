@@ -1,24 +1,10 @@
-# =====================================================================
-# OmniASR (CTC) fine-tuning configuration
-# ---------------------------------------------------------------------
-# Consumed by ``models/omniasr_trainer.py``.
-#
-#   python train.py --model_type omniasr --variant omniasr-300m
-#   python train.py --model_type omniasr --variant omniasr-1b
-#
-# OmniASR ships a tri-stage learning-rate schedule: a linear warmup
-# fraction, a flat-hold fraction, and a linear decay over the
-# remainder of training.  The fractions below match the paper.
-# =====================================================================
-
 defaults:
   sample_rate: 16000
 
-  # Schedule (paper) ----------------------------------------------------
+  # Schedule ----------------------------------------------------
   learning_rate: 5.0e-5
   warmup_ratio: 0.10
   hold_ratio: 0.40
-  # decay_ratio is implicitly 1 - warmup_ratio - hold_ratio
   weight_decay: 0.0
   max_grad_norm: 1.0
   optimizer: adamw_torch
@@ -56,7 +42,7 @@ defaults:
   dataloader_num_workers: 2
   report_to: [tensorboard]
   seed: 42
-  trust_remote_code: true     # OmniASR ships custom modeling code
+  trust_remote_code: true
 
 variants:
 
@@ -65,11 +51,11 @@ variants:
     max_steps: 48000
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 4   # effective batch 32
+    gradient_accumulation_steps: 4
 
   omniasr-1b:
     model_name_or_path: nvidia/omniasr-1b
     max_steps: 36000
     per_device_train_batch_size: 4
     per_device_eval_batch_size: 2
-    gradient_accumulation_steps: 8   # effective batch 32
+    gradient_accumulation_steps: 8

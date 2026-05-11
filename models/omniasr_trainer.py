@@ -1,33 +1,3 @@
-"""
-models/omniasr_trainer.py
-=========================
-
-OmniASR (CTC) fine-tuning entry point.
-
-OmniASR ships a custom modeling implementation, so the model and the
-processor are loaded with ``trust_remote_code=True``.  We use the
-modern :class:`AutoModelForCTC` / :class:`AutoFeatureExtractor` /
-:class:`AutoTokenizer` factories so that any future repository
-restructuring is picked up transparently.
-
-Two changes set this trainer apart from the other CTC trainers:
-
-* **Tri-stage learning-rate scheduler.**  The paper specifies a
-  warmup → flat-hold → linear-decay schedule.  We implement this as
-  a :class:`torch.optim.lr_scheduler.LambdaLR` and pass the
-  ``(optimizer, scheduler)`` tuple to the Trainer via the
-  ``optimizers=`` argument so the standard
-  :func:`Trainer.create_optimizer_and_scheduler` is bypassed.
-
-* **trust_remote_code.**  Both the feature extractor and the model
-  are downloaded with this flag so OmniASR's custom code is honoured.
-
-The expected paper results are:
-
-* OmniASR 300M  — WER ≈ 13.82% / CER ≈ 2.97%  (48k steps)
-* OmniASR  1B   — WER ≈ 13.09% / CER ≈ 2.75%  (36k steps)
-"""
-
 from __future__ import annotations
 
 import logging
@@ -70,19 +40,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "omniasr.yaml"
 
-
-# ---------------------------------------------------------------------------
-# Lightweight processor wrapper
-# ---------------------------------------------------------------------------
-
-
 class OmniASRProcessor:
-    """FE + tokenizer bundle for OmniASR.
-
-    The same minimal interface used by the Wav2Vec2-BERT trainer:
-    ``feature_extractor``, ``tokenizer`` and ``save_pretrained``.
-    """
-
     def __init__(self, feature_extractor: Any, tokenizer: Any) -> None:
         self.feature_extractor = feature_extractor
         self.tokenizer = tokenizer
@@ -92,11 +50,6 @@ class OmniASRProcessor:
         directory.mkdir(parents=True, exist_ok=True)
         self.feature_extractor.save_pretrained(str(directory))
         self.tokenizer.save_pretrained(str(directory))
-
-
-# ---------------------------------------------------------------------------
-# Args
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -114,7 +67,6 @@ class OmniASRTrainArgs:
 
     sample_rate: int = 16000
 
-    # Schedule (tri-stage)
     learning_rate: float = 5e-5
     max_steps: int = 48000
     warmup_ratio: float = 0.10
@@ -123,34 +75,28 @@ class OmniASRTrainArgs:
     max_grad_norm: float = 1.0
     optimizer: str = "adamw_torch"
 
-    # Batching
     per_device_train_batch_size: int = 8
     per_device_eval_batch_size: int = 4
     gradient_accumulation_steps: int = 4
 
-    # Cadence
     eval_steps: int = 1000
     save_steps: int = 1000
     logging_steps: int = 100
     save_total_limit: int = 3
 
-    # Mixed precision / memory
     fp16: bool = True
     bf16: bool = False
     gradient_checkpointing: bool = True
 
-    # Best-model selection
     metric_for_best_model: str = "wer"
     greater_is_better: bool = False
     load_best_model_at_end: bool = True
     early_stopping_patience: int = 5
     early_stopping_threshold: float = 0.0
 
-    # CTC
     ctc_loss_reduction: str = "mean"
     ctc_zero_infinity: bool = True
 
-    # Misc
     use_augmentation: bool = False
     seed: int = 42
     deterministic: bool = False
@@ -162,17 +108,8 @@ class OmniASRTrainArgs:
     trust_remote_code: bool = True
     hf_token: Optional[str] = None
 
-    # Audio-length safety (CTC) -----------------------------------------
-    # OmniASR ships custom modeling code; we cannot inspect its
-    # masking parameters generically.  Apply the same dataset-level
-    # filter as the other CTC trainers as a precaution.
     min_train_audio_duration_sec: float = 1.0
-    min_collator_input_samples: int = 0  # no-op for input_features path
-
-
-# ---------------------------------------------------------------------------
-# YAML loader
-# ---------------------------------------------------------------------------
+    min_collator_input_samples: int = 0
 
 
 def load_yaml_config(
@@ -202,29 +139,12 @@ def load_yaml_config(
     return merged
 
 
-# ---------------------------------------------------------------------------
-# Tri-stage scheduler
-# ---------------------------------------------------------------------------
-
-
 def tri_stage_lambda(
     *,
     total_steps: int,
     warmup_ratio: float,
     hold_ratio: float,
 ) -> Any:
-    """Return a callable suitable for ``LambdaLR``.
-
-    The schedule is, as a fraction of the base learning rate:
-
-        ramp-up :  step / warmup_steps           for step < warmup_steps
-        hold    :  1.0                           during the hold window
-        decay   :  1 - (step - end_hold) / decay_steps  (linear)
-
-    All three windows are computed from ``total_steps`` so the
-    schedule is *aligned* with ``max_steps`` without requiring any
-    in-loop bookkeeping.
-    """
     if total_steps <= 0:
         raise ValueError(f"total_steps must be > 0 (got {total_steps})")
     if not 0.0 <= warmup_ratio <= 1.0:
@@ -269,11 +189,6 @@ def build_tri_stage_scheduler(
     )
 
 
-# ---------------------------------------------------------------------------
-# Processor / model
-# ---------------------------------------------------------------------------
-
-
 def build_processor(args: OmniASRTrainArgs) -> OmniASRProcessor:
     feature_extractor = AutoFeatureExtractor.from_pretrained(
         args.model_name_or_path,
@@ -299,9 +214,6 @@ def build_model(
         "ignore_mismatched_sizes": True,
     }
 
-    # CTC overrides only attach to configs that already declare these
-    # fields; pass them through ``**kwargs`` and let HF's
-    # ``from_pretrained`` ignore any unknown keys with a warning.
     optional_overrides: Dict[str, Any] = {
         "ctc_loss_reduction": args.ctc_loss_reduction,
         "ctc_zero_infinity": args.ctc_zero_infinity,
@@ -319,11 +231,6 @@ def build_model(
         model.config.use_cache = False
 
     return model
-
-
-# ---------------------------------------------------------------------------
-# Dataset preparation
-# ---------------------------------------------------------------------------
 
 
 def _add_input_length_column(dataset: DatasetDict) -> DatasetDict:
@@ -398,7 +305,6 @@ def prepare_dataset(
 # Training arguments
 # ---------------------------------------------------------------------------
 
-
 def build_training_args(
     args: OmniASRTrainArgs,
     *,
@@ -409,10 +315,7 @@ def build_training_args(
     if logging_dir is not None:
         Path(logging_dir).mkdir(parents=True, exist_ok=True)
 
-    # The tri-stage scheduler is supplied via ``optimizers=`` below,
-    # so ``lr_scheduler_type`` and ``warmup_steps`` are deliberately
-    # left at the Trainer defaults — the custom scheduler overrides
-    # both completely.
+
     return TrainingArguments(
         output_dir=str(output_dir),
         logging_dir=str(logging_dir) if logging_dir is not None else None,
@@ -451,21 +354,10 @@ def build_training_args(
     )
 
 
-# ---------------------------------------------------------------------------
-# Optimizer / scheduler factory
-# ---------------------------------------------------------------------------
-
-
 def build_optimizer_and_scheduler(
     model: torch.nn.Module,
     args: OmniASRTrainArgs,
 ) -> Tuple[torch.optim.Optimizer, LambdaLR]:
-    """Build an AdamW optimizer paired with the tri-stage scheduler.
-
-    We construct the optimizer manually (rather than letting the
-    Trainer build it) because the tri-stage schedule cannot be
-    expressed via the built-in ``lr_scheduler_type`` strings.
-    """
     no_decay = ("bias", "LayerNorm.weight", "layer_norm.weight")
     decay_params: List[torch.nn.Parameter] = []
     no_decay_params: List[torch.nn.Parameter] = []
@@ -499,13 +391,7 @@ def build_optimizer_and_scheduler(
     return optimizer, scheduler
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-
 def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
-    """Run end-to-end OmniASR fine-tuning."""
     configure_logging()
     set_global_seed(args.seed, deterministic=args.deterministic)
 
@@ -540,14 +426,11 @@ def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
     )
     project_cfg.ensure_dirs()
 
-    logger.info("=" * 70)
     logger.info("OmniASR fine-tuning — variant=%s", args.variant)
     logger.info("Model:        %s", args.model_name_or_path)
     logger.info("Checkpoints:  %s", output_dir)
     logger.info("Final model:  %s", final_dir)
     logger.info("TensorBoard:  %s", tensorboard_dir)
-    logger.info("Storage root: %s", layout.root)
-    logger.info("=" * 70)
 
     processor = build_processor(args)
     processor.save_pretrained(output_dir)
@@ -581,10 +464,6 @@ def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
 
     optimizer, scheduler = build_optimizer_and_scheduler(model, args)
 
-    # Pass the full ``OmniASRProcessor`` wrapper so per-checkpoint
-    # auto-saves include the feature extractor as well as the
-    # tokenizer.  This is required for resume + ``evaluate.py``
-    # against intermediate checkpoint directories.
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -616,12 +495,6 @@ def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
     logger.info("Training complete. Final eval metrics: %s", eval_metrics)
     return eval_metrics
 
-
-# ---------------------------------------------------------------------------
-# YAML -> args glue
-# ---------------------------------------------------------------------------
-
-
 def args_from_yaml(
     yaml_path: Union[str, Path],
     variant: Optional[str] = None,
@@ -645,10 +518,6 @@ def args_from_yaml(
             )
     return OmniASRTrainArgs(**filtered)
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 __all__ = [
     "DEFAULT_CONFIG_PATH",

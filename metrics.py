@@ -1,34 +1,3 @@
-"""
-metrics.py
-==========
-
-Word- and character-error-rate computation plus error analysis helpers.
-
-This module is the single source of truth for ASR metrics across the
-project.  It uses the modern :mod:`evaluate` library when available
-and falls back to direct :mod:`jiwer` calls when ``evaluate`` cannot
-download its metric script (e.g. air-gapped Colab sessions).
-
-The high-level surface is:
-
-* :class:`MetricCalculator`
-        Caches the underlying ``evaluate`` metric handles so the
-        Trainer's ``compute_metrics`` callback stays cheap.
-
-* :func:`compute_wer` / :func:`compute_cer`
-        Convenience wrappers used by the evaluation script and unit
-        tests.
-
-* :func:`analyze_substitutions`
-        Counts character-level substitutions across the test split,
-        with a special focus on Hutsul vowel pairs (и↔і, е↔є, …).
-
-* :func:`build_compute_metrics_seq2seq`
-        Trainer-compatible factory for Whisper.
-
-* :func:`build_compute_metrics_ctc`
-        Trainer-compatible factory for CTC models.
-"""
 
 from __future__ import annotations
 
@@ -56,39 +25,24 @@ from utils.text_normalization import build_default_normalizer
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Optional metric backends
-# ---------------------------------------------------------------------------
-
 try:
-    import evaluate  # type: ignore
+    import evaluate
 
     _HAS_EVALUATE = True
-except ImportError:  # pragma: no cover
+except ImportError:
     _HAS_EVALUATE = False
-    evaluate = None  # type: ignore[assignment]
+    evaluate = None
 
 try:
     import jiwer
 
     _HAS_JIWER = True
-except ImportError:  # pragma: no cover
+except ImportError:
     _HAS_JIWER = False
-    jiwer = None  # type: ignore[assignment]
-
-
-# ---------------------------------------------------------------------------
-# Metric calculator
-# ---------------------------------------------------------------------------
+    jiwer = None
 
 
 class MetricCalculator:
-    """Thin caching wrapper around ``evaluate`` / ``jiwer``.
-
-    A single instance is created per training run and reused inside
-    ``compute_metrics`` so we do not re-download metric scripts on
-    every evaluation step.
-    """
 
     def __init__(self) -> None:
         self._wer_metric = None
@@ -98,7 +52,7 @@ class MetricCalculator:
             try:
                 self._wer_metric = evaluate.load("wer")
                 self._cer_metric = evaluate.load("cer")
-            except Exception as exc:  # pragma: no cover — network failure
+            except Exception as exc:
                 logger.warning(
                     "evaluate.load failed (%s) — falling back to jiwer", exc
                 )
@@ -109,7 +63,6 @@ class MetricCalculator:
                 "one (`pip install evaluate jiwer`)."
             )
 
-    # ------------------------------------------------------------------
     def compute_wer(
         self,
         predictions: Sequence[str],
@@ -120,7 +73,7 @@ class MetricCalculator:
                 f"predictions and references differ in length: "
                 f"{len(predictions)} vs {len(references)}"
             )
-        # Empty references break both backends — drop those pairs.
+
         preds, refs = _drop_empty_pairs(predictions, references)
         if not refs:
             return 0.0
@@ -132,12 +85,11 @@ class MetricCalculator:
                         predictions=preds, references=refs
                     )
                 )
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 logger.warning("evaluate WER failed (%s) — using jiwer", exc)
 
         return float(jiwer.wer(refs, preds))
 
-    # ------------------------------------------------------------------
     def compute_cer(
         self,
         predictions: Sequence[str],
@@ -159,12 +111,11 @@ class MetricCalculator:
                         predictions=preds, references=refs
                     )
                 )
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 logger.warning("evaluate CER failed (%s) — using jiwer", exc)
 
         return float(jiwer.cer(refs, preds))
 
-    # ------------------------------------------------------------------
     def compute_both(
         self,
         predictions: Sequence[str],
@@ -174,11 +125,6 @@ class MetricCalculator:
             "wer": self.compute_wer(predictions, references),
             "cer": self.compute_cer(predictions, references),
         }
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _drop_empty_pairs(
@@ -199,7 +145,6 @@ def compute_wer(
     predictions: Sequence[str],
     references: Sequence[str],
 ) -> float:
-    """Module-level WER convenience wrapper."""
     return MetricCalculator().compute_wer(predictions, references)
 
 
@@ -207,31 +152,20 @@ def compute_cer(
     predictions: Sequence[str],
     references: Sequence[str],
 ) -> float:
-    """Module-level CER convenience wrapper."""
     return MetricCalculator().compute_cer(predictions, references)
-
-
-# ---------------------------------------------------------------------------
-# Substitution / error analysis
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class ErrorAnalysisResult:
-    """Container for the output of :func:`analyze_substitutions`."""
-
     total_words: int = 0
     total_chars: int = 0
 
-    # ``Counter`` of (ref_char, hyp_char) pairs.
     substitutions: Counter = field(default_factory=Counter)
     insertions: Counter = field(default_factory=Counter)
     deletions: Counter = field(default_factory=Counter)
 
-    # Tracked dialect-specific pairs.
     dialect_pairs: Dict[str, int] = field(default_factory=dict)
 
-    # ------------------------------------------------------------------
     def to_dict(self, top_k: int = 30) -> Dict[str, Any]:
         return {
             "total_words": self.total_words,
@@ -251,7 +185,7 @@ class ErrorAnalysisResult:
             "dialect_pairs": dict(self.dialect_pairs),
         }
 
-    # ------------------------------------------------------------------
+
     def to_json(
         self, path: Union[str, Path], top_k: int = 30, indent: int = 2
     ) -> Path:
@@ -268,23 +202,9 @@ class ErrorAnalysisResult:
         return path
 
 
-# ---------------------------------------------------------------------------
-
-
 def _levenshtein_alignment(ref: str, hyp: str) -> List[Tuple[str, str, str]]:
-    """Return a list of ``(op, ref_char, hyp_char)`` triples.
-
-    ``op`` is one of ``"match"``, ``"sub"``, ``"ins"``, ``"del"``.
-    Trailing/leading whitespace differences are preserved in the
-    alignment so that callers can post-filter if they wish.
-
-    A standard Wagner–Fischer DP is used; complexity is O(|ref| × |hyp|)
-    in time and memory.  For typical Hutsul utterances (≤ 200 chars
-    each) this is comfortably fast.
-    """
     n = len(ref)
     m = len(hyp)
-    # cost table
     dp = np.zeros((n + 1, m + 1), dtype=np.int32)
     for i in range(n + 1):
         dp[i, 0] = i
@@ -297,12 +217,11 @@ def _levenshtein_alignment(ref: str, hyp: str) -> List[Tuple[str, str, str]]:
                 dp[i, j] = dp[i - 1, j - 1]
             else:
                 dp[i, j] = 1 + min(
-                    dp[i - 1, j - 1],  # substitution
-                    dp[i - 1, j],      # deletion
-                    dp[i, j - 1],      # insertion
+                    dp[i - 1, j - 1],
+                    dp[i - 1, j],
+                    dp[i, j - 1],
                 )
 
-    # Back-trace
     ops: List[Tuple[str, str, str]] = []
     i, j = n, m
     while i > 0 or j > 0:
@@ -329,26 +248,13 @@ def _levenshtein_alignment(ref: str, hyp: str) -> List[Tuple[str, str, str]]:
     return ops
 
 
-# ---------------------------------------------------------------------------
-
-
 def analyze_substitutions(
     predictions: Sequence[str],
     references: Sequence[str],
     *,
     dialect_pairs: Sequence[Tuple[str, str]] = DIALECT_SUBSTITUTION_PAIRS,
 ) -> ErrorAnalysisResult:
-    """Compute character-level error statistics.
 
-    Parameters
-    ----------
-    predictions, references
-        Already-normalised hypothesis / reference strings.
-    dialect_pairs
-        Iterable of ``(ref_char, hyp_char)`` pairs to count separately
-        in :attr:`ErrorAnalysisResult.dialect_pairs`.  Defaults to
-        :data:`config.DIALECT_SUBSTITUTION_PAIRS`.
-    """
     if len(predictions) != len(references):
         raise ValueError(
             f"predictions and references differ in length: "
@@ -384,32 +290,13 @@ def analyze_substitutions(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Trainer ``compute_metrics`` factories
-# ---------------------------------------------------------------------------
-
-
 def build_compute_metrics_seq2seq(
     processor: Any,
     *,
     metric_calculator: Optional[MetricCalculator] = None,
     normalize: bool = True,
 ) -> Callable[[Any], Dict[str, float]]:
-    """Build a Whisper-compatible ``compute_metrics`` callable.
 
-    Parameters
-    ----------
-    processor
-        The :class:`transformers.WhisperProcessor` instance.
-    metric_calculator
-        Optional cached calculator.  A fresh one is created when
-        omitted.
-    normalize
-        Whether to apply the project text normaliser to both
-        references and predictions before WER/CER computation.  This
-        is what the paper does and matches the behaviour of
-        ``evaluate.py``.
-    """
     metric_calculator = metric_calculator or MetricCalculator()
     normalizer = build_default_normalizer() if normalize else None
 
@@ -421,9 +308,7 @@ def build_compute_metrics_seq2seq(
     )
 
     def compute_metrics(eval_pred: Any) -> Dict[str, float]:
-        # ``eval_pred`` is an ``EvalPrediction`` namedtuple OR a plain
-        # tuple ``(preds, labels)``.  In ``predict_with_generate``
-        # mode ``preds`` is already token ids, otherwise logits.
+
         preds = (
             eval_pred.predictions
             if hasattr(eval_pred, "predictions")
@@ -435,16 +320,12 @@ def build_compute_metrics_seq2seq(
             else eval_pred[1]
         )
 
-        # Some Trainer versions return a tuple when generate=True.
         if isinstance(preds, tuple):
             preds = preds[0]
 
-        # Argmax if we got logits.
         if preds.ndim == 3:
             preds = np.argmax(preds, axis=-1)
 
-        # Replace -100 in labels with the pad token id so the tokenizer
-        # can decode them.
         labels = np.where(labels != -100, labels, pad_token_id)
 
         pred_str = tokenizer.batch_decode(preds, skip_special_tokens=True)
@@ -459,21 +340,13 @@ def build_compute_metrics_seq2seq(
     return compute_metrics
 
 
-# ---------------------------------------------------------------------------
-
-
 def build_compute_metrics_ctc(
     processor: Any,
     *,
     metric_calculator: Optional[MetricCalculator] = None,
     normalize: bool = True,
 ) -> Callable[[Any], Dict[str, float]]:
-    """Build a CTC ``compute_metrics`` callable.
 
-    ``processor`` is expected to expose a ``tokenizer`` attribute (or
-    behave like one) with a CTC-style ``batch_decode`` that joins
-    characters using the configured word delimiter.
-    """
     metric_calculator = metric_calculator or MetricCalculator()
     normalizer = build_default_normalizer() if normalize else None
 
@@ -499,22 +372,15 @@ def build_compute_metrics_ctc(
         if isinstance(preds, tuple):
             preds = preds[0]
 
-        # CTC: argmax over vocab dimension to get token ids.
         if preds.ndim == 3:
             pred_ids = np.argmax(preds, axis=-1)
         else:
             pred_ids = preds
 
-        # Replace -100 (ignored) with pad so we can decode label ids.
         labels = np.where(labels != -100, labels, pad_token_id)
 
         pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-        # ``group_tokens=False`` is a Wav2Vec2-CTC-tokenizer-specific
-        # kwarg that disables the repeat-collapsing logic the CTC
-        # decoder applies to predictions.  Labels are already clean
-        # targets, so we want NO collapsing.  However, OmniASR ships
-        # a custom tokenizer that may not accept this kwarg — fall
-        # back to plain decoding in that case.
+
         try:
             label_str = tokenizer.batch_decode(
                 labels, skip_special_tokens=True, group_tokens=False
@@ -532,10 +398,6 @@ def build_compute_metrics_ctc(
 
     return compute_metrics
 
-
-# ---------------------------------------------------------------------------
-# Public surface
-# ---------------------------------------------------------------------------
 
 __all__ = [
     "ErrorAnalysisResult",
