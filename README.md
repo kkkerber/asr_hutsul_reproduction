@@ -43,8 +43,8 @@ asr_hutsul_reproduction/
 │   └── callbacks.py          
 ├── outputs/                  
 └── notebooks/
-    ├── colab_training.ipynb  ← main Colab entry point
-    └── inference_demo.ipynb  ← single-file transcription demo
+    ├── colab_training.ipynb  
+    └── inference_demo.ipynb  
 ```
 ---
 
