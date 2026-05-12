@@ -45,6 +45,13 @@ class OmniASRProcessor:
         self.feature_extractor = feature_extractor
         self.tokenizer = tokenizer
 
+    @property
+    def model_input_names(self) -> List[str]:
+        # Required by Trainer.get_train_dataloader() (transformers >= 4.44)
+        # under group_by_length=True.
+        names = getattr(self.feature_extractor, "model_input_names", None)
+        return list(names) if names else ["input_features"]
+
     def save_pretrained(self, directory: Union[str, Path]) -> None:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)

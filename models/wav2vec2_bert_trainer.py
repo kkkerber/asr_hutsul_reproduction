@@ -52,6 +52,14 @@ class W2VBertProcessor:
         self.feature_extractor = feature_extractor
         self.tokenizer = tokenizer
 
+    @property
+    def model_input_names(self) -> List[str]:
+        # Trainer.get_train_dataloader() (transformers >= 4.44) reads
+        # this when group_by_length=True.  Mirror ProcessorMixin and
+        # delegate to the feature extractor.
+        names = getattr(self.feature_extractor, "model_input_names", None)
+        return list(names) if names else ["input_features"]
+
     def save_pretrained(self, directory: Union[str, Path]) -> None:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
