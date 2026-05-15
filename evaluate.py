@@ -294,9 +294,12 @@ def _load_whisper(
     model.generation_config.language = "uk"
     model.generation_config.task = "transcribe"
     model.generation_config.forced_decoder_ids = None
-    model.generation_config.suppress_tokens = []
+    # transformers >= 4.45 reads suppress_tokens[-2] during
+    # _prepare_decoder_input_ids; an empty list crashes with
+    # ``IndexError: index -2 is out of bounds``.  Use ``None``.
+    model.generation_config.suppress_tokens = None
     model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
+    model.config.suppress_tokens = None
     model.config.use_cache = True
 
     # Seed lang_to_id / task_to_id / no_timestamps_token_id for older

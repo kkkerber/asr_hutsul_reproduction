@@ -169,12 +169,16 @@ def build_model(args: WhisperTrainArgs) -> WhisperForConditionalGeneration:
     model.generation_config.language = args.language
     model.generation_config.task = args.task
     model.generation_config.forced_decoder_ids = None
-    model.generation_config.suppress_tokens = []
+    # transformers >= 4.45 indexes suppress_tokens[-2] during
+    # _prepare_decoder_input_ids; an empty list crashes with
+    # ``IndexError: index -2 is out of bounds``.  ``None`` is the
+    # canonical "no suppression" sentinel.
+    model.generation_config.suppress_tokens = None
     model.generation_config.max_length = args.generation_max_length
     model.generation_config.num_beams = args.num_beams
 
     model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
+    model.config.suppress_tokens = None
     model.config.use_cache = False
 
     return model
