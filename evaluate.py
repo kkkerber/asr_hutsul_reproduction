@@ -299,6 +299,17 @@ def _load_whisper(
     model.config.suppress_tokens = []
     model.config.use_cache = True
 
+    # Seed lang_to_id / task_to_id / no_timestamps_token_id for older
+    # checkpoints (transformers >= 4.45 requires them inside generate()).
+    from models.whisper_trainer import ensure_whisper_generation_metadata
+
+    ensure_whisper_generation_metadata(
+        model,
+        processor,
+        base_model_id or str(checkpoint_dir),
+        hf_token=hf_token,
+    )
+
     return LoadedModel(
         family="whisper",
         model=model,

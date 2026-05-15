@@ -209,6 +209,98 @@ def maybe_apply_lora(
     return peft_model
 
 
+def ensure_whisper_generation_metadata(
+    model: torch.nn.Module,
+    processor: Any,
+    model_name_or_path: Optional[str] = None,
+    *,
+    hf_token: Optional[str] = None,
+) -> None:
+    """Populate ``lang_to_id`` / ``task_to_id`` / ``no_timestamps_token_id``
+    on ``model.generation_config`` if any are missing.
+
+    transformers >= 4.45 requires these mappings inside
+    ``Whisper.generate()`` to resolve the language and task prefix
+    tokens.  Older checkpoints (e.g. ``arampacha/whisper-large-uk-2``)
+    ship a ``generation_config.json`` predating that schema, so we
+    seed the missing fields from a freshly loaded GenerationConfig
+    first and fall back to the tokenizer vocabulary.
+    """
+    # Unwrap a PEFT wrapper to reach the original Whisper config.
+    target = (
+        getattr(model, "base_model", model).model
+        if hasattr(model, "base_model")
+        else model
+    )
+    gen_cfg = getattr(target, "generation_config", None)
+    if gen_cfg is None:
+        return
+
+    needed = ("lang_to_id", "task_to_id", "no_timestamps_token_id")
+    if all(getattr(gen_cfg, n, None) for n in needed):
+        return
+
+    if model_name_or_path:
+        try:
+            from transformers import GenerationConfig
+
+            fresh = GenerationConfig.from_pretrained(
+                model_name_or_path, token=hf_token
+            )
+            for n in needed:
+                if not getattr(gen_cfg, n, None) and getattr(fresh, n, None):
+                    setattr(gen_cfg, n, getattr(fresh, n))
+        except Exception as exc:
+            logger.warning(
+                "Could not reload GenerationConfig from %s (%s); will "
+                "build mappings from the tokenizer.",
+                model_name_or_path,
+                exc,
+            )
+
+    if all(getattr(gen_cfg, n, None) for n in needed):
+        return
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return
+
+    import re
+
+    unk_id = tokenizer.unk_token_id
+
+    if not getattr(gen_cfg, "lang_to_id", None):
+        lang_to_id: Dict[str, int] = {}
+        for tok, idx in tokenizer.get_vocab().items():
+            m = re.fullmatch(r"<\|([a-z]{2,3})\|>", tok)
+            if m:
+                lang_to_id[tok] = int(idx)
+        if lang_to_id:
+            gen_cfg.lang_to_id = lang_to_id
+
+    if not getattr(gen_cfg, "task_to_id", None):
+        task_to_id: Dict[str, int] = {}
+        for task in ("transcribe", "translate"):
+            idx = tokenizer.convert_tokens_to_ids(f"<|{task}|>")
+            if isinstance(idx, int) and idx != unk_id:
+                task_to_id[task] = idx
+        if task_to_id:
+            gen_cfg.task_to_id = task_to_id
+
+    if not getattr(gen_cfg, "no_timestamps_token_id", None):
+        idx = tokenizer.convert_tokens_to_ids("<|notimestamps|>")
+        if isinstance(idx, int) and idx != unk_id:
+            gen_cfg.no_timestamps_token_id = idx
+
+    logger.info(
+        "Whisper generation_config metadata ready: "
+        "lang_to_id=%d langs, task_to_id=%d tasks, no_timestamps_token_id=%s",
+        len(getattr(gen_cfg, "lang_to_id", {}) or {}),
+        len(getattr(gen_cfg, "task_to_id", {}) or {}),
+        getattr(gen_cfg, "no_timestamps_token_id", None),
+    )
+
+
 def prepare_dataset(
     args: WhisperTrainArgs,
     processor: WhisperProcessor,
@@ -348,6 +440,11 @@ def train_whisper(args: WhisperTrainArgs) -> Dict[str, float]:
 
     processor = build_processor(args)
     model = build_model(args)
+    # Seed generation_config.lang_to_id / task_to_id / no_timestamps_token_id
+    # BEFORE PEFT wrapping so we operate on the bare Whisper config.
+    ensure_whisper_generation_metadata(
+        model, processor, args.model_name_or_path, hf_token=args.hf_token
+    )
     model = maybe_apply_lora(model, args)
 
     dataset = prepare_dataset(args, processor, project_cfg)
@@ -465,6 +562,7 @@ __all__ = [
     "args_from_yaml",
     "build_model",
     "build_processor",
+    "ensure_whisper_generation_metadata",
     "build_seq2seq_training_args",
     "load_yaml_config",
     "maybe_apply_lora",
