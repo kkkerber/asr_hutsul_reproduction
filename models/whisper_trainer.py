@@ -226,13 +226,15 @@ def ensure_whisper_generation_metadata(
     seed the missing fields from a freshly loaded GenerationConfig
     first and fall back to the tokenizer vocabulary.
     """
-    # Unwrap a PEFT wrapper to reach the original Whisper config.
-    target = (
-        getattr(model, "base_model", model).model
-        if hasattr(model, "base_model")
-        else model
-    )
-    gen_cfg = getattr(target, "generation_config", None)
+    # ``generation_config`` is owned by the inner Whisper model, but
+    # both ``WhisperForConditionalGeneration`` and ``PeftModel`` expose
+    # it directly: HF stores it as a plain attribute, and PEFT's
+    # ``__getattr__`` proxies missing names through ``base_model`` to
+    # the wrapped model.  Mutating the returned object mutates the one
+    # underlying ``GenerationConfig`` instance, so we deliberately do
+    # NOT walk ``.base_model.model`` — that path is wrapper-specific
+    # and crashes on raw Whisper (``WhisperModel`` has no ``.model``).
+    gen_cfg = getattr(model, "generation_config", None)
     if gen_cfg is None:
         return
 
