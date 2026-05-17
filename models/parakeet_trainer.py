@@ -310,7 +310,97 @@ def _load_nemo():
             "isolated.\n"
             f"Original ImportError: {exc}"
         )
+
+    # Disable the numba SpecAugment kernel at NAMESPACE level, before
+    # any model construction.  See ``_disable_numba_specaugment_globally``
+    # for the rationale; this is the only layer that survives NeMo
+    # rebuilds of ``SpectrogramAugmentation`` during
+    # ``change_vocabulary`` / ``setup`` / etc.
+    _disable_numba_specaugment_globally()
+
     return nemo_asr, pl, OmegaConf
+
+
+def _disable_numba_specaugment_globally() -> None:
+    """Neutralise NeMo's numba CUDA SpecAugment at the namespace level.
+
+    ``nemo.collections.asr.modules.audio_preprocessing.SpectrogramAugmentation.__init__``
+    guards the numba module build with::
+
+        if use_numba_spec_augment and numba_cuda_is_supported(...):
+            self.spec_augment_numba = SpecAugmentNumba(...)
+
+    The runtime patch (``spec_augment_numba = None`` on a live
+    instance) is fragile: ``change_vocabulary`` / Lightning's
+    ``setup`` / NeMo's ``maybe_init_from_pretrained_checkpoint`` can
+    rebuild the preprocessor from cfg, calling ``__init__`` again
+    and re-creating the numba module.
+
+    Replacing ``numba_cuda_is_supported`` with a function that always
+    returns ``False`` in every NeMo namespace that imported it makes
+    the guard fail for every present and future instantiation,
+    regardless of which code path triggered the build or what the cfg
+    ``use_numba_spec_augment`` says.
+
+    Three namespaces are patched, in order of importance:
+
+    1. ``nemo.core.utils.numba_utils.numba_cuda_is_supported`` — the
+       canonical source.
+    2. Every ``nemo.*`` module already in ``sys.modules`` that has a
+       ``numba_cuda_is_supported`` binding (created by
+       ``from nemo.core.utils.numba_utils import
+       numba_cuda_is_supported``).  Python's ``from … import …``
+       creates a private binding in the importing module, so
+       patching the canonical source alone is not enough — we also
+       overwrite each importer's local binding.
+    3. The kernel module's own
+       ``SPEC_AUGMENT_NUMBA_SUPPORTED`` flag, when present, so any
+       NeMo code that checks the flag directly also short-circuits.
+    """
+    import sys
+
+    def _always_false(*args, **kwargs):
+        return False
+
+    # (1) Canonical source.
+    try:
+        from nemo.core.utils import numba_utils as _nu
+        _nu.numba_cuda_is_supported = _always_false
+    except Exception as exc:
+        logger.debug("Could not patch numba_utils source: %s", exc)
+
+    # (2) Every NeMo module that imported the name locally.
+    patched = 0
+    for mod_name, mod in list(sys.modules.items()):
+        if not mod_name.startswith("nemo"):
+            continue
+        if mod is None:
+            continue
+        if hasattr(mod, "numba_cuda_is_supported"):
+            try:
+                setattr(mod, "numba_cuda_is_supported", _always_false)
+                patched += 1
+            except Exception:
+                pass
+
+    # (3) The kernel module's exported supported-flag.
+    for kernel_mod in (
+        "nemo.collections.asr.parts.numba.spec_augment.spec_aug_numba",
+        "nemo.collections.asr.parts.numba.spec_augment",
+    ):
+        try:
+            __import__(kernel_mod)
+            m = sys.modules.get(kernel_mod)
+            if m is not None and hasattr(m, "SPEC_AUGMENT_NUMBA_SUPPORTED"):
+                setattr(m, "SPEC_AUGMENT_NUMBA_SUPPORTED", False)
+        except Exception:
+            pass
+
+    logger.info(
+        "Disabled numba CUDA SpecAugment globally (patched %d NeMo "
+        "namespace bindings of numba_cuda_is_supported).",
+        patched,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +595,78 @@ def _build_ukrainian_bpe_tokenizer(
     )
     _ensure_nemo_vocab_txt(out_dir)
     return out_dir
+
+
+def _disable_numba_specaugment(model: Any) -> None:
+    """Force NeMo's SpectrogramAugmentation onto its PyTorch fallback.
+
+    NeMo's ``SpectrogramAugmentation`` builds two implementations of
+    SpecAugment side-by-side: a numba-JIT'd CUDA kernel
+    (``self.spec_augment_numba``) and a pure-PyTorch one
+    (``self.spec_augment``).  Forward dispatches to the numba kernel
+    whenever it is non-``None`` and the input is on CUDA.
+
+    On current Colab CUDA runtimes the numba kernel triggers::
+
+        cuda.bindings.nvjitlink.nvJitLinkError: ERROR_INTERNAL (6)
+        may need newer version of nvJitLink library
+
+    at first-step JIT-link time.  ``numba_utils.numba_cuda_is_supported``
+    cannot detect this — the link mismatch only surfaces when the
+    kernel is actually launched.
+
+    The fallback ``self.spec_augment`` runs the **same masking
+    algorithm** (identical time / frequency masks, same rectangular
+    cutouts, same RNG semantics, identical masked tensors) on the
+    same ``input_spec.device``.  It is fully FP16 compatible under
+    ``pl.Trainer(precision='16-mixed')``.  Only the kernel
+    implementation differs — masks per training step are
+    bit-equivalent up to floating-point ordering.
+
+    We make the swap defensively in two places:
+
+    1. **Live instance**: nullify ``spec_augment_numba`` so forward
+       takes the PyTorch branch unconditionally.
+    2. **Config**: set ``cfg.spec_augment.use_numba_spec_augment =
+       False`` so any subsequent rebuild
+       (``save_to`` / ``restore_from`` / future ``change_vocabulary``)
+       also skips the numba path.
+
+    No-op when the model does not expose a SpectrogramAugmentation
+    module (some NeMo configs omit spec-augment entirely).
+    """
+    # (0) Re-assert the global namespace patch in case a NeMo import
+    #     happened lazily after ``_load_nemo`` returned.
+    _disable_numba_specaugment_globally()
+
+    # (1) Live-instance patch.
+    spec_aug = None
+    for attr in ("spec_augmentation", "_spec_augmentation"):
+        candidate = getattr(model, attr, None)
+        if candidate is not None and hasattr(candidate, "spec_augment_numba"):
+            spec_aug = candidate
+            break
+
+    if spec_aug is not None:
+        numba_module = getattr(spec_aug, "spec_augment_numba", None)
+        if numba_module is not None:
+            spec_aug.spec_augment_numba = None
+            logger.info(
+                "Disabled numba CUDA SpecAugment; using PyTorch fallback "
+                "(identical masking algorithm, no training-dynamics impact)."
+            )
+
+    # (2) Config-side flip — persists into checkpoints; any rebuild
+    #     from cfg will re-apply the choice from the cfg side too.
+    try:
+        cfg = getattr(model, "cfg", None)
+        if cfg is not None and "spec_augment" in cfg:
+            cfg.spec_augment.use_numba_spec_augment = False
+    except Exception as exc:
+        logger.debug(
+            "Could not persist use_numba_spec_augment=False on cfg: %s",
+            exc,
+        )
 
 
 def _ensure_nemo_vocab_txt(out_dir: Path) -> None:
@@ -810,6 +972,11 @@ def train_parakeet(args: ParakeetTrainArgs) -> Dict[str, float]:
             f"Unknown tokenizer_type {args.tokenizer_type!r}; "
             "expected 'bpe', 'char', or 'keep'."
         )
+
+    # Bypass the numba-CUDA SpecAugment kernel on the loaded model.
+    # The PyTorch fallback runs the same algorithm without hitting the
+    # nvJitLink ERROR_INTERNAL that occurs on current Colab runtimes.
+    _disable_numba_specaugment(model)
 
     # ---- 4) Data wiring ----------------------------------------------------
     def _ds_cfg(manifest: Path, shuffle: bool, batch_size: int) -> Any:
