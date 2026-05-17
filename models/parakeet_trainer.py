@@ -143,6 +143,13 @@ def _check_numpy_compat() -> None:
     if not hasattr(np, "NaN"):
         np.NaN = np.nan
 
+    # ``np.trapz`` renamed to ``np.trapezoid`` in NumPy 2.0 (same
+    # function, same signature, identical numerics).  numba-cuda's
+    # ``@overload(np.trapz)`` at import time crashes on NumPy 2.x
+    # without this alias.
+    if not hasattr(np, "trapz") and hasattr(np, "trapezoid"):
+        np.trapz = np.trapezoid
+
     # ``np.sctypes`` (NeMo audio preprocessing path).
     # Only the buckets NeMo touches need to be populated faithfully;
     # ``others`` is included for completeness so any other library that
@@ -461,6 +468,7 @@ def _build_ukrainian_bpe_tokenizer(
 
     if model_file.exists():
         logger.info("Reusing existing SentencePiece BPE at %s", model_file)
+        _ensure_nemo_vocab_txt(out_dir)
         return out_dir
 
     corpus_file = out_dir / "corpus.txt"
@@ -495,7 +503,54 @@ def _build_ukrainian_bpe_tokenizer(
         "Trained SentencePiece BPE (vocab_size=%d) on %d lines at %s",
         vocab_size, n_lines, model_file,
     )
+    _ensure_nemo_vocab_txt(out_dir)
     return out_dir
+
+
+def _ensure_nemo_vocab_txt(out_dir: Path) -> None:
+    """Materialise ``vocab.txt`` next to ``tokenizer.model``.
+
+    ``SentencePieceTrainer`` writes ``tokenizer.model`` and
+    ``tokenizer.vocab`` (lines of ``<token>\\t<log_prob>``).  NeMo's
+    ``EncDecCTCModelBPE.change_vocabulary(new_tokenizer_dir=...,
+    new_tokenizer_type='bpe')`` instead expects ``vocab.txt`` —
+    bare tokens, one per line, no scores.  Without it
+    ``change_vocabulary`` warns ``src path does not exist`` and
+    silently keeps Parakeet's English tokenizer.
+
+    Idempotent: skips when ``vocab.txt`` already exists, so previously
+    cached ``tokenizer_v128`` directories (including those produced by
+    runs that pre-date this fix) are upgraded in place on the next
+    training launch.
+    """
+    out_dir = Path(out_dir)
+    vocab_txt = out_dir / "vocab.txt"
+    if vocab_txt.exists() and vocab_txt.stat().st_size > 0:
+        return
+
+    spv = out_dir / "tokenizer.vocab"
+    if not spv.exists():
+        raise FileNotFoundError(
+            f"SentencePiece vocab file not found: {spv}. "
+            "Delete the tokenizer directory and let it retrain."
+        )
+
+    n_tokens = 0
+    with open(spv, "r", encoding="utf-8") as fin, \
+         open(vocab_txt, "w", encoding="utf-8") as fout:
+        for line in fin:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            # SentencePiece format: ``<token>\t<log_prob>``.  Strip
+            # everything from the first tab onwards.
+            tok = line.split("\t", 1)[0]
+            fout.write(tok + "\n")
+            n_tokens += 1
+    logger.info(
+        "Wrote NeMo-compatible vocab.txt (%d tokens) at %s",
+        n_tokens, vocab_txt,
+    )
 
 
 # ---------------------------------------------------------------------------
