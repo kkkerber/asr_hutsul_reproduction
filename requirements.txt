@@ -29,3 +29,9 @@ scikit-learn>=1.4
 
 ipywidgets>=8.1
 ipykernel>=6.29
+
+# ---- Optional: NVIDIA NeMo (for the Parakeet trainer only) -----------
+# Heavy (~5 GB) and overlaps several transitive deps with transformers.
+# Not pinned here — install in a dedicated venv when training Parakeet:
+#   pip install 'nemo_toolkit[asr]>=1.23' pytorch_lightning
+

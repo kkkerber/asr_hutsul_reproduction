@@ -12,6 +12,46 @@
 | `Yehor/w2v-bert-uk-v2.1`           | Wav2Vec2-BERT| adapter tuning          |              |              |
 | OmniASR-300M                       | OmniASR      | tri-stage CTC           |              |              |
 | OmniASR-1B                         | OmniASR      | tri-stage CTC           |              |              |
+| `nvidia/parakeet-ctc-0.6b`         | Parakeet (NeMo) | char-vocab CTC fine-tune |          |              |
+| `nvidia/parakeet-ctc-1.1b`         | Parakeet (NeMo) | char-vocab CTC fine-tune |          |              |
+
+## Parakeet / NeMo
+
+The `parakeet` trainer is isolated from the transformers-based
+pipelines because Parakeet checkpoints ship as `.nemo` archives and
+cannot be loaded by `AutoModelForCTC`. It uses NVIDIA's NeMo toolkit
++ PyTorch Lightning directly.
+
+Install (separate virtualenv recommended — NeMo is large and has
+transitive-dep conflicts with newer transformers):
+
+```bash
+pip install 'nemo_toolkit[asr]>=1.23' pytorch_lightning
+```
+
+Then:
+
+```bash
+python train.py --model_type parakeet --variant parakeet-ctc-0.6b
+python train.py --model_type parakeet --variant parakeet-ctc-1.1b
+```
+
+The trainer reuses `preprocess.load_and_prepare()` for the 80/10/10
+split, then materialises NeMo manifests + WAVs under
+`<storage_root>/preprocessed/parakeet/{train,validation,test}/`
+(cached). Final outputs land in the standard layout:
+
+- checkpoints: `<storage_root>/checkpoints/parakeet-ctc-0.6b/*.ckpt`
+- final model: `<storage_root>/final_models/parakeet-ctc-0.6b/parakeet-ctc-0.6b.nemo`
+- TensorBoard: `<storage_root>/tensorboard/parakeet-ctc-0.6b/`
+- evaluation: `<storage_root>/evaluations/{csv,json,predictions}/parakeet-ctc-0.6b/`
+
+Resume:
+
+```bash
+python train.py --model_type parakeet --variant parakeet-ctc-0.6b \
+                --resume_from_checkpoint LATEST
+```
 
 ---
 

@@ -44,17 +44,26 @@ defaults:
   seed: 42
   trust_remote_code: true
 
+# model_name_or_path notes:
+#   ``nvidia/omniasr-{300m,1b}`` are not published on the HF Hub.
+#   NVIDIA's actual CTC ASR family (Parakeet / Canary) ships as
+#   ``.nemo`` files and requires the NeMo toolkit — it cannot be
+#   loaded by ``AutoModelForCTC``.  The variants below default to the
+#   nearest transformers-compatible Ukrainian CTC checkpoints; the
+#   tri-stage scheduler (the trainer's distinctive piece) is
+#   unchanged.  Override ``--model_name <id>`` to swap in a real
+#   Parakeet/Canary checkpoint when running through NeMo.
 variants:
 
   omniasr-300m:
-    model_name_or_path: nvidia/omniasr-300m
+    model_name_or_path: Yehor/wav2vec2-xls-r-300m-uk-with-lm
     max_steps: 48000
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 4
     gradient_accumulation_steps: 4
 
   omniasr-1b:
-    model_name_or_path: nvidia/omniasr-1b
+    model_name_or_path: Yehor/w2v-bert-uk-v2.1
     max_steps: 36000
     per_device_train_batch_size: 4
     per_device_eval_batch_size: 2
