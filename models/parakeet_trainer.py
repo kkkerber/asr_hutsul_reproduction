@@ -96,26 +96,42 @@ class ParakeetTrainArgs:
 
 
 def _check_numpy_compat() -> None:
-    """Restore the deprecated capitalized NumPy aliases.
+    """Restore the NumPy 1.x names that NumPy 2.0 removed.
 
-    NumPy 2.0 removed ``np.Inf`` / ``np.NaN`` / ``np.Infinity`` /
-    ``np.PINF`` / ``np.NINF``.  ``pytorch_lightning <= 2.2.x``
-    (which is the range NeMo 1.23.x pins) still reads ``np.Inf`` in
-    ``ModelCheckpoint`` and a few metric initializers, raising::
+    Two distinct removals hit NeMo 1.23 / Lightning <= 2.2:
 
-        AttributeError: `np.Inf` was removed in the NumPy 2.0 release.
-        Use `np.inf` instead.
+    1. **Scalar infinities / NaN aliases.**  ``np.Inf`` / ``np.NaN`` /
+       ``np.Infinity`` / ``np.PINF`` / ``np.NINF`` are read by
+       ``pytorch_lightning.callbacks.ModelCheckpoint`` and a few
+       metric initialisers.  Removed in NumPy 2.0:
 
-    The Lightning code path only *reads* these aliases — it never
-    writes to them — so re-attaching them as views onto the lower-
-    case versions is safe and fully reversible.  We do this only
-    inside the Parakeet pre-flight; the rest of the project never
-    touches the removed names.
+           AttributeError: `np.Inf` was removed in the NumPy 2.0 release.
+
+    2. **``np.sctypes`` dispatch dict.**  Used by NeMo's
+       ``AudioSegment._convert_samples_to_float32`` (and a handful of
+       other audio preprocessing helpers) to decide whether a sample
+       array is integer-typed and therefore needs the
+       ``1 / 2**(bits-1)`` scaling for [-1, 1] normalisation:
+
+           if samples.dtype in np.sctypes['int']: ...
+           elif samples.dtype in np.sctypes['float']: ...
+
+       Removed in NumPy 2.0.
+
+    NeMo / Lightning only *read* these names — they never assign to
+    them — so attaching them back onto the live ``numpy`` module is
+    safe and reversible.  All restorations are guarded by
+    ``hasattr`` so we never clobber a still-present attribute on
+    NumPy 1.x (or any future NumPy 2.x point release that brings the
+    names back).  The patch is confined to the Parakeet pipeline;
+    nothing else in this project references the removed names.
     """
     try:
         import numpy as np
     except ImportError:
         return
+
+    # Scalar inf / nan aliases (Lightning callback path).
     if not hasattr(np, "Inf"):
         np.Inf = np.inf
     if not hasattr(np, "Infinity"):
@@ -126,6 +142,19 @@ def _check_numpy_compat() -> None:
         np.NINF = -np.inf
     if not hasattr(np, "NaN"):
         np.NaN = np.nan
+
+    # ``np.sctypes`` (NeMo audio preprocessing path).
+    # Only the buckets NeMo touches need to be populated faithfully;
+    # ``others`` is included for completeness so any other library that
+    # iterates the full dict does not KeyError.
+    if not hasattr(np, "sctypes"):
+        np.sctypes = {
+            "int":     [np.int8, np.int16, np.int32, np.int64],
+            "uint":    [np.uint8, np.uint16, np.uint32, np.uint64],
+            "float":   [np.float16, np.float32, np.float64],
+            "complex": [np.complex64, np.complex128],
+            "others":  [np.bool_, np.object_, np.bytes_, np.str_, np.void],
+        }
 
 
 def _check_huggingface_hub_compat() -> None:
