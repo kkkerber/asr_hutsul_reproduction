@@ -95,6 +95,72 @@ class ParakeetTrainArgs:
 # ---------------------------------------------------------------------------
 
 
+def _check_huggingface_hub_compat() -> None:
+    """Monkeypatch ``HfFolder`` / ``ModelFilter`` onto ``huggingface_hub``.
+
+    NeMo 1.x's ``nemo.core.classes.common`` imports::
+
+        from huggingface_hub import HfApi, HfFolder, ModelFilter, hf_hub_download
+
+    ``ModelFilter`` was removed in huggingface_hub 0.23 and ``HfFolder``
+    in 0.26.  The transformers stack the rest of this project relies on
+    requires huggingface_hub >= 0.24, so we cannot downgrade globally.
+
+    We inject backward-compatible shims into the live ``huggingface_hub``
+    module *before* NeMo imports.  The shims expose only the surface
+    NeMo touches: ``HfFolder.get_token / save_token / delete_token``
+    and a no-op ``ModelFilter`` data class.  transformers never reads
+    these names, so the patch is invisible to the rest of the project.
+    """
+    try:
+        import huggingface_hub as _hh
+    except ImportError:
+        return
+
+    if not hasattr(_hh, "HfFolder"):
+        class _HfFolderShim:
+            @staticmethod
+            def get_token():
+                getter = getattr(_hh, "get_token", None)
+                try:
+                    return getter() if callable(getter) else None
+                except Exception:
+                    return None
+
+            @staticmethod
+            def save_token(token):
+                login = getattr(_hh, "login", None)
+                if not callable(login):
+                    return
+                try:
+                    login(token=token, add_to_git_credential=False)
+                except TypeError:
+                    try:
+                        login(token)
+                    except Exception:
+                        pass
+
+            @staticmethod
+            def delete_token():
+                logout = getattr(_hh, "logout", None)
+                if callable(logout):
+                    try:
+                        logout()
+                    except Exception:
+                        pass
+
+        _hh.HfFolder = _HfFolderShim
+
+    if not hasattr(_hh, "ModelFilter"):
+        class _ModelFilterShim:
+            def __init__(self, *args, **kwargs):
+                self._args = args
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        _hh.ModelFilter = _ModelFilterShim
+
+
 def _check_torchvision_abi() -> None:
     """Pre-flight ABI check.
 
@@ -157,6 +223,7 @@ def _check_torchvision_abi() -> None:
 
 def _load_nemo():
     _check_torchvision_abi()
+    _check_huggingface_hub_compat()
     try:
         import nemo  # noqa: F401
         import nemo.collections.asr as nemo_asr
@@ -299,9 +366,73 @@ def _materialize_manifest(
 # ---------------------------------------------------------------------------
 
 
-def _build_char_vocab() -> List[str]:
-    """Ukrainian char-level vocab consistent with the rest of the project."""
-    return list(UKRAINIAN_ALPHABET) + [APOSTROPHE, " "]
+def _build_ukrainian_bpe_tokenizer(
+    train_manifest: Path,
+    out_dir: Path,
+    vocab_size: int = 128,
+) -> Path:
+    """Train a small SentencePiece BPE tokenizer on the Ukrainian
+    transcripts from ``train_manifest`` and return the directory
+    holding the resulting ``.model`` / ``.vocab`` files.
+
+    Cached: if a previous training wrote ``tokenizer.model``, the
+    function is a no-op.  The tiny vocab (~128 by default) gives the
+    BPE a near-character behaviour, which is what we want for low-
+    resource fine-tuning on Hutsul.
+
+    This is the canonical NeMo path for replacing
+    ``EncDecCTCModelBPE`` 's tokenizer — the ``new_vocabulary``
+    keyword used by the char-CTC model is **not** accepted by the
+    BPE variant.  The replacement is then applied via:
+
+        model.change_vocabulary(
+            new_tokenizer_dir=<this dir>, new_tokenizer_type="bpe"
+        )
+    """
+    import sentencepiece as spm
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_prefix = out_dir / "tokenizer"
+    model_file = model_prefix.with_suffix(".model")
+
+    if model_file.exists():
+        logger.info("Reusing existing SentencePiece BPE at %s", model_file)
+        return out_dir
+
+    corpus_file = out_dir / "corpus.txt"
+    n_lines = 0
+    with open(train_manifest, "r", encoding="utf-8") as fh, \
+         open(corpus_file, "w", encoding="utf-8") as out:
+        for line in fh:
+            entry = json.loads(line)
+            text = (entry.get("text") or "").strip()
+            if text:
+                out.write(text + "\n")
+                n_lines += 1
+    if n_lines == 0:
+        raise RuntimeError(
+            f"No non-empty transcripts in {train_manifest}; cannot "
+            "train a SentencePiece tokenizer."
+        )
+
+    spm.SentencePieceTrainer.train(
+        input=str(corpus_file),
+        model_prefix=str(model_prefix),
+        vocab_size=vocab_size,
+        character_coverage=1.0,
+        model_type="bpe",
+        pad_id=0,
+        unk_id=1,
+        bos_id=-1,
+        eos_id=-1,
+        normalization_rule_name="identity",
+    )
+    logger.info(
+        "Trained SentencePiece BPE (vocab_size=%d) on %d lines at %s",
+        vocab_size, n_lines, model_file,
+    )
+    return out_dir
 
 
 # ---------------------------------------------------------------------------
@@ -516,20 +647,51 @@ def train_parakeet(args: ParakeetTrainArgs) -> Dict[str, float]:
         map_location="cpu",
     )
 
-    # ---- 3) Vocabulary swap (canonical low-resource path) ------------------
-    if args.tokenizer_type == "char":
-        char_vocab = _build_char_vocab()
+    # ---- 3) Vocabulary swap ------------------------------------------------
+    # ``EncDecCTCModelBPE.change_vocabulary`` does NOT accept
+    # ``new_vocabulary=`` (that signature is on the char-CTC model).
+    # The BPE variant requires ``new_tokenizer_dir`` + ``new_tokenizer_type``
+    # pointing at a SentencePiece model trained on the target language.
+    # ``tokenizer_type``:
+    #   "bpe"  -> train a small SP BPE on the train manifest (default)
+    #   "char" -> alias for a tiny (~64) BPE that behaves char-like
+    #   "keep" -> do nothing (Parakeet's English BPE survives; only
+    #             useful as a sanity-check path, not for real Ukrainian
+    #             fine-tuning)
+    if args.tokenizer_type in ("bpe", "char"):
+        vocab_size = 64 if args.tokenizer_type == "char" else 128
         try:
-            model.change_vocabulary(new_vocabulary=char_vocab)
+            tok_dir = _build_ukrainian_bpe_tokenizer(
+                train_manifest,
+                manifests_root / f"tokenizer_v{vocab_size}",
+                vocab_size=vocab_size,
+            )
+            model.change_vocabulary(
+                new_tokenizer_dir=str(tok_dir),
+                new_tokenizer_type="bpe",
+            )
             logger.info(
-                "Switched vocabulary to char-level (%d tokens)",
-                len(char_vocab),
+                "Switched to Ukrainian SentencePiece BPE (vocab_size=%d)",
+                vocab_size,
             )
         except Exception as exc:
             logger.warning(
-                "change_vocabulary failed (%s); keeping base BPE tokenizer.",
+                "Tokenizer replacement failed (%s); keeping Parakeet's "
+                "base BPE tokenizer.  Fine-tuning on Ukrainian will be "
+                "degraded — re-train with tokenizer_type='keep' if you "
+                "want this state deliberately.",
                 exc,
             )
+    elif args.tokenizer_type == "keep":
+        logger.info(
+            "tokenizer_type='keep': leaving Parakeet's base tokenizer "
+            "unchanged."
+        )
+    else:
+        raise ValueError(
+            f"Unknown tokenizer_type {args.tokenizer_type!r}; "
+            "expected 'bpe', 'char', or 'keep'."
+        )
 
     # ---- 4) Data wiring ----------------------------------------------------
     def _ds_cfg(manifest: Path, shuffle: bool, batch_size: int) -> Any:

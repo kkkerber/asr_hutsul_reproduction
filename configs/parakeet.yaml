@@ -33,10 +33,16 @@ defaults:
   # Audio-length safety (consistent with the other CTC trainers).
   min_train_audio_duration_sec: 1.0
 
-  # Vocabulary swap: 'char' replaces the English BPE with the project's
-  # Ukrainian char vocab.  Set to 'bpe' to keep Parakeet's original
-  # SentencePiece tokenizer (only useful for English-aligned data).
-  tokenizer_type: char
+  # Vocabulary swap for Parakeet's BPE backbone.
+  #   'bpe'  -> train a small SentencePiece BPE (vocab_size=128) on
+  #            the Ukrainian training transcripts and apply it via
+  #            EncDecCTCModelBPE.change_vocabulary(new_tokenizer_dir=...).
+  #            This is the canonical low-resource path.
+  #   'char' -> alias for a tiny (~64) BPE that behaves char-like.
+  #   'keep' -> leave Parakeet's English BPE untouched.  Pipeline
+  #            runs but Cyrillic input tokenises to mostly UNK —
+  #            only useful as a sanity-check path.
+  tokenizer_type: bpe
 
 variants:
 
