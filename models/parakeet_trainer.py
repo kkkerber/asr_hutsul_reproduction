@@ -95,7 +95,68 @@ class ParakeetTrainArgs:
 # ---------------------------------------------------------------------------
 
 
+def _check_torchvision_abi() -> None:
+    """Pre-flight ABI check.
+
+    NeMo -> pytorch_lightning -> torchmetrics -> torchvision is the
+    transitive import chain.  Colab sessions where NeMo's installer
+    has reshuffled the torch stack often leave ``torchvision`` ABI-
+    mismatched with the running torch, surfacing as
+
+        RuntimeError: operator torchvision::nms does not exist
+
+    when torchvision tries to ``torch.library.register_fake`` its NMS
+    op.  torchvision is not used by anything in this project — it is
+    pulled in only by torchmetrics, which treats it as optional — so
+    the canonical user fix is to uninstall it.  We catch the broken
+    state here and re-raise with an actionable message instead of
+    letting it bubble up from inside the NeMo import.
+    """
+    try:
+        import torch  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "torch is required for the Parakeet pipeline."
+        ) from exc
+
+    try:
+        import torchvision  # noqa: F401
+    except ImportError:
+        # torchvision absent entirely -> torchmetrics degrades cleanly.
+        return
+    except RuntimeError as exc:
+        msg = str(exc)
+        looks_like_abi = (
+            "torchvision::nms" in msg
+            or "operator torchvision" in msg
+            or "register_fake" in msg
+        )
+        if not looks_like_abi:
+            raise
+        import torch
+        raise RuntimeError(
+            "torchvision is installed but ABI-incompatible with the "
+            f"running torch ({torch.__version__}).  This is a known "
+            "Colab failure mode after NeMo's installer reshuffles the "
+            "torch stack.  torchvision is NOT used by this project — "
+            "it is pulled in transitively by torchmetrics, which "
+            "degrades cleanly when it is absent.\n\n"
+            "Fix (pick ONE), then 'Runtime -> Restart runtime' and "
+            "re-run the Parakeet install cell:\n\n"
+            "    pip uninstall -y torchvision\n"
+            "      # cleanest: removes the offending package; "
+            "torchmetrics keeps working without it\n\n"
+            "    pip install --upgrade --force-reinstall --no-deps torchvision\n"
+            "      # alternative: let pip resolve a build matching the "
+            "active torch\n\n"
+            "Drive checkpoints, preprocessing caches and NeMo manifests "
+            "are unaffected.\n\n"
+            f"Original error: {exc}"
+        ) from exc
+
+
 def _load_nemo():
+    _check_torchvision_abi()
     try:
         import nemo  # noqa: F401
         import nemo.collections.asr as nemo_asr
