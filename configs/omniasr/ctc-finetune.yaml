@@ -1,0 +1,74 @@
+# Meta-schema YAML template for the official fairseq2 OmniASR recipe.
+#
+# This file is consumed VERBATIM by
+#   python -m workflows.recipes.wav2vec2.asr <out_dir> --config-file <this>
+# after ``models/omniasr_trainer.py`` injects the dataset manifest
+# paths via OmegaConf.update and writes a resolved copy next to the
+# run output_dir.
+#
+# Schema verified from:
+#   * official ctc-finetune.yaml in workflows/recipes/wav2vec2/asr/configs/
+#   * asset card omnilingual-asr/src/omnilingual_asr/cards/models/rc_models_v1.yaml
+#
+# Field names match what the official recipe expects.  When the
+# upstream recipe schema evolves, update this template (not the
+# Python launcher).
+
+model:
+  name: omniASR_CTC_300M
+
+tokenizer:
+  name: omniASR_tokenizer_v1
+
+dataset:
+  # ManifestAsrDataset configuration — keys injected by the launcher.
+  name: manifest_asr
+  splits:
+    train:
+      manifest: __PLACEHOLDER_TRAIN_TSV__
+      transcriptions: __PLACEHOLDER_TRAIN_WRD__
+    valid:
+      manifest: __PLACEHOLDER_DEV_TSV__
+      transcriptions: __PLACEHOLDER_DEV_WRD__
+  sample_rate: 16000
+  min_audio_len_seconds: 1.0
+  max_audio_len_seconds: 30.0
+  normalize_audio: true
+
+optimizer:
+  name: adamw
+  config:
+    lr: 5.0e-5
+    weight_decay: 1.0e-3
+    betas: [0.9, 0.98]
+
+scheduler:
+  name: tri_stage
+  config:
+    warmup_ratio: 0.10
+    hold_ratio: 0.40
+    final_lr_scale: 0.01
+
+trainer:
+  max_num_steps: 48000
+  grad_accumulation:
+    num_batches: 4
+  batch_size: 8
+  precision: float16
+  gradient_clip_norm: 1.0
+  seed: 42
+
+regime:
+  checkpoint_every_n_steps: 1000
+  validate_every_n_steps: 1000
+
+# SpecAugment is supported by the recipe's AsrTask.  Conservative
+# defaults; the launcher does not currently override this block, so
+# edit here to tune.
+augmentation:
+  spec_augment:
+    enabled: true
+    time_mask_count: 2
+    time_mask_max_size: 40
+    freq_mask_count: 2
+    freq_mask_max_size: 27

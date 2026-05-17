@@ -1,54 +1,93 @@
+"""Real Meta OmniASR (fairseq2) launcher.
+
+Replaces the previous fake HF ``AutoModelForCTC``-based trainer.  This
+module is a thin orchestrator: it converts the project's HF dataset
+into the fairseq2 manifest layout, renders the Meta recipe YAML with
+the right dataset paths injected, and invokes the official entrypoint::
+
+    python -m workflows.recipes.wav2vec2.asr <output_dir> \\
+        --config-file <rendered_yaml>
+
+fairseq2 and the ``omnilingual-asr`` repository are runtime-only
+dependencies — not pinned in ``requirements.txt`` (same isolation
+discipline used for the Parakeet/NeMo pipeline).  Install them in a
+dedicated Colab runtime; see README "OmniASR / fairseq2" section.
+
+Asset resolution
+----------------
+
+The Meta-schema YAML at ``configs/omniasr/ctc-finetune.yaml`` declares::
+
+    model:     { name: omniASR_CTC_300M }
+    tokenizer: { name: omniASR_tokenizer_v1 }
+
+Both names resolve through the asset card at
+``omnilingual-asr/src/omnilingual_asr/cards/models/rc_models_v1.yaml``
+which points at:
+
+    checkpoint: https://dl.fbaipublicfiles.com/mms/omniASR-CTC-300M.pt
+    tokenizer:  https://dl.fbaipublicfiles.com/mms/omniASR_tokenizer.model
+
+fairseq2 downloads both into its asset cache on first use.
+
+No HF Transformers code path runs anywhere in this module.
+"""
+
 from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
-import torch
-from torch.optim.lr_scheduler import LambdaLR
-from datasets import Dataset, DatasetDict
-from transformers import (
-    AutoFeatureExtractor,
-    AutoModelForCTC,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
-
 from config import (
+    DEFAULT_DATASET_NAME,
     PROJECT_ROOT,
     ProjectConfig,
     configure_logging,
     resolve_storage_layout,
     set_global_seed,
 )
-from metrics import (
-    MetricCalculator,
-    build_compute_metrics_ctc,
-)
-from preprocess import load_and_prepare, prepare_for_model
-from utils.augmentation import build_augmentation_pipeline
-from utils.callbacks import build_default_callbacks
-from utils.collators import DataCollatorCTCWithPadding
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "omniasr.yaml"
+META_YAML_DIR = PROJECT_ROOT / "configs" / "omniasr"
+DEFAULT_META_TEMPLATE = META_YAML_DIR / "ctc-finetune.yaml"
+DEFAULT_REPO_LOCAL = Path("/content/omnilingual-asr")
+RECIPE_MODULE = "workflows.recipes.wav2vec2.asr"
+
+
+# ---------------------------------------------------------------------------
+# Legacy compatibility stub
+# ---------------------------------------------------------------------------
+
 
 class OmniASRProcessor:
+    """Backward-compat stub for ``evaluate.py:_load_omniasr``.
+
+    The new fairseq2 pipeline never instantiates this class.  It is
+    kept only so that the legacy HF-format auto-detection branch in
+    ``evaluate.py`` can still import the symbol when evaluating any
+    older HF-format checkpoint that happens to live on disk.  Real
+    Meta OmniASR fine-tunes save fairseq2 ``.pt`` archives and are
+    evaluated through the official recipe, not through
+    ``evaluate.py``.
+    """
+
     def __init__(self, feature_extractor: Any, tokenizer: Any) -> None:
         self.feature_extractor = feature_extractor
         self.tokenizer = tokenizer
 
     @property
     def model_input_names(self) -> List[str]:
-        # Required by Trainer.get_train_dataloader() (transformers >= 4.44)
-        # under group_by_length=True.
         names = getattr(self.feature_extractor, "model_input_names", None)
         return list(names) if names else ["input_features"]
 
@@ -59,11 +98,17 @@ class OmniASRProcessor:
         self.tokenizer.save_pretrained(str(directory))
 
 
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class OmniASRTrainArgs:
-    model_name_or_path: str
+    """CLI / YAML arguments for the Meta OmniASR launcher."""
+
     variant: str
-    dataset_name: str
+    dataset_name: str = DEFAULT_DATASET_NAME
     dataset_config: Optional[str] = None
     audio_column: Optional[str] = None
     text_column: Optional[str] = None
@@ -72,51 +117,43 @@ class OmniASRTrainArgs:
     run_name: Optional[str] = None
     resume_from_checkpoint: Optional[str] = None
 
-    sample_rate: int = 16000
-
-    learning_rate: float = 5e-5
-    max_steps: int = 48000
-    warmup_ratio: float = 0.10
-    hold_ratio: float = 0.40
-    weight_decay: float = 0.0
-    max_grad_norm: float = 1.0
-    optimizer: str = "adamw_torch"
-
-    per_device_train_batch_size: int = 8
-    per_device_eval_batch_size: int = 4
-    gradient_accumulation_steps: int = 4
-
-    eval_steps: int = 1000
-    save_steps: int = 1000
-    logging_steps: int = 100
-    save_total_limit: int = 3
-
-    fp16: bool = True
-    bf16: bool = False
-    gradient_checkpointing: bool = True
-
-    metric_for_best_model: str = "wer"
-    greater_is_better: bool = False
-    load_best_model_at_end: bool = True
-    early_stopping_patience: int = 5
-    early_stopping_threshold: float = 0.0
-
-    ctc_loss_reduction: str = "mean"
-    ctc_zero_infinity: bool = True
-
-    use_augmentation: bool = False
     seed: int = 42
     deterministic: bool = False
-    dataloader_num_workers: int = 2
-    report_to: List[str] = field(default_factory=lambda: ["tensorboard"])
-    remove_unused_columns: bool = False
-    group_by_length: bool = True
-    length_column_name: str = "input_length"
-    trust_remote_code: bool = True
-    hf_token: Optional[str] = None
+    sample_rate: int = 16000
 
+    # Paths to the Meta runtime
+    meta_repo_path: Optional[str] = None
+    meta_yaml_template: Optional[str] = None
+
+    # Smoke-test toggle and step count
+    smoke: bool = False
+    smoke_train_size: int = 10
+    smoke_dev_size: int = 5
+    smoke_steps: int = 50
+
+    # Paper-scale recipe overrides (mapped 1:1 into the rendered YAML)
+    max_num_steps: int = 48000
+    grad_accumulation_num_batches: int = 4
+    batch_size: int = 8
+    learning_rate: float = 5.0e-5
+    warmup_ratio: float = 0.10
+    hold_ratio: float = 0.40
+    precision: str = "float16"
+    checkpoint_every_n_steps: int = 1000
+    validate_every_n_steps: int = 1000
     min_train_audio_duration_sec: float = 1.0
-    min_collator_input_samples: int = 0
+
+    # Carried for logging only; the real load is driven by the asset
+    # name inside the rendered Meta YAML.
+    model_name_or_path: str = "omniASR_CTC_300M"
+
+    hf_token: Optional[str] = None
+    trust_remote_code: bool = False
+
+
+# ---------------------------------------------------------------------------
+# YAML helpers
+# ---------------------------------------------------------------------------
 
 
 def load_yaml_config(
@@ -124,14 +161,13 @@ def load_yaml_config(
     *,
     variant: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Same defaults+variants schema used by the other trainers."""
     with open(path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
-
     defaults = dict(raw.get("defaults", {}))
     variants = raw.get("variants", {})
     if not variants:
         raise ValueError(f"{path} declares no variants")
-
     if variant is None:
         variant = next(iter(variants.keys()))
         logger.info("No --variant given, defaulting to %s", variant)
@@ -140,265 +176,264 @@ def load_yaml_config(
             f"Variant {variant!r} not in {path}. "
             f"Available: {sorted(variants)}"
         )
-
     merged = {**defaults, **variants[variant]}
     merged["variant"] = variant
     return merged
 
 
-def tri_stage_lambda(
+def args_from_yaml(
+    yaml_path: Union[str, Path],
+    variant: Optional[str] = None,
     *,
-    total_steps: int,
-    warmup_ratio: float,
-    hold_ratio: float,
-) -> Any:
-    if total_steps <= 0:
-        raise ValueError(f"total_steps must be > 0 (got {total_steps})")
-    if not 0.0 <= warmup_ratio <= 1.0:
-        raise ValueError(f"warmup_ratio must be in [0,1] (got {warmup_ratio})")
-    if not 0.0 <= hold_ratio <= 1.0:
-        raise ValueError(f"hold_ratio must be in [0,1] (got {hold_ratio})")
-    if warmup_ratio + hold_ratio > 1.0:
-        raise ValueError(
-            f"warmup_ratio + hold_ratio must be <= 1.0 "
-            f"(got {warmup_ratio + hold_ratio})"
-        )
-
-    warmup_steps = max(1, int(total_steps * warmup_ratio))
-    hold_steps = int(total_steps * hold_ratio)
-    decay_steps = max(1, total_steps - warmup_steps - hold_steps)
-
-    def _fn(step: int) -> float:
-        if step < warmup_steps:
-            return float(step) / float(warmup_steps)
-        if step < warmup_steps + hold_steps:
-            return 1.0
-        progress = (step - warmup_steps - hold_steps) / float(decay_steps)
-        return max(0.0, 1.0 - progress)
-
-    return _fn
-
-
-def build_tri_stage_scheduler(
-    optimizer: torch.optim.Optimizer,
-    *,
-    total_steps: int,
-    warmup_ratio: float,
-    hold_ratio: float,
-) -> LambdaLR:
-    return LambdaLR(
-        optimizer,
-        lr_lambda=tri_stage_lambda(
-            total_steps=total_steps,
-            warmup_ratio=warmup_ratio,
-            hold_ratio=hold_ratio,
-        ),
-    )
-
-
-def build_processor(args: OmniASRTrainArgs) -> OmniASRProcessor:
-    feature_extractor = AutoFeatureExtractor.from_pretrained(
-        args.model_name_or_path,
-        token=args.hf_token,
-        trust_remote_code=args.trust_remote_code,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path,
-        token=args.hf_token,
-        trust_remote_code=args.trust_remote_code,
-    )
-    return OmniASRProcessor(
-        feature_extractor=feature_extractor, tokenizer=tokenizer
-    )
-
-
-def build_model(
-    args: OmniASRTrainArgs, processor: OmniASRProcessor
-) -> torch.nn.Module:
-    model_kwargs: Dict[str, Any] = {
-        "token": args.hf_token,
-        "trust_remote_code": args.trust_remote_code,
-        "ignore_mismatched_sizes": True,
-    }
-
-    optional_overrides: Dict[str, Any] = {
-        "ctc_loss_reduction": args.ctc_loss_reduction,
-        "ctc_zero_infinity": args.ctc_zero_infinity,
-    }
-    if processor.tokenizer.pad_token_id is not None:
-        optional_overrides["pad_token_id"] = processor.tokenizer.pad_token_id
-
-    model = AutoModelForCTC.from_pretrained(
-        args.model_name_or_path,
-        **optional_overrides,
-        **model_kwargs,
-    )
-
-    if args.gradient_checkpointing and hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-
-    return model
-
-
-def _add_input_length_column(dataset: DatasetDict) -> DatasetDict:
-    def _len(example: Dict[str, Any]) -> Dict[str, Any]:
-        if "input_features" in example:
-            example["input_length"] = len(example["input_features"])
-        elif "input_values" in example:
-            example["input_length"] = len(example["input_values"])
-        else:
-            example["input_length"] = 0
-        return example
-
-    new_splits: Dict[str, Dataset] = {}
-    for split, ds in dataset.items():
-        new_splits[split] = ds.map(
-            _len, desc=f"Adding input_length to {split}"
-        )
-    return DatasetDict(new_splits)
-
-
-def prepare_dataset(
-    args: OmniASRTrainArgs,
-    processor: OmniASRProcessor,
-    project_config: ProjectConfig,
-) -> DatasetDict:
-    raw, audio_col, text_col = load_and_prepare(
-        project_config,
-        dataset_name=args.dataset_name,
-        dataset_config=args.dataset_config,
-        audio_column=args.audio_column,
-        text_column=args.text_column,
-        token=args.hf_token,
-        trust_remote_code=args.trust_remote_code,
-    )
-
-    aug_pipeline = build_augmentation_pipeline(
-        use_augmentation=args.use_augmentation,
-        sample_rate=args.sample_rate,
-        enable_specaugment=False,
-    )
-    waveform_aug = (
-        (lambda samples, sr: aug_pipeline.apply_waveform(samples, sr))
-        if aug_pipeline.waveform is not None
-        else None
-    )
-
-    fe = processor.feature_extractor
-    feature_kwargs: Dict[str, Any] = {"padding": False}
-    if hasattr(fe, "return_attention_mask"):
-        feature_kwargs["return_attention_mask"] = fe.return_attention_mask
-
-    prepared = prepare_for_model(
-        raw,
-        audio_column=audio_col,
-        text_column=text_col,
-        feature_extractor=processor.feature_extractor,
-        tokenizer=processor.tokenizer,
-        sample_rate=args.sample_rate,
-        waveform_augmenter=waveform_aug,
-        augment_splits=("train",),
-        feature_kwargs=feature_kwargs,
-        tokenizer_kwargs={},
-    )
-
-    if args.group_by_length:
-        prepared = _add_input_length_column(prepared)
-
-    return prepared
-
-
-# ---------------------------------------------------------------------------
-# Training arguments
-# ---------------------------------------------------------------------------
-
-def build_training_args(
-    args: OmniASRTrainArgs,
-    *,
-    logging_dir: Optional[Path] = None,
-) -> TrainingArguments:
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if logging_dir is not None:
-        Path(logging_dir).mkdir(parents=True, exist_ok=True)
-
-
-    return TrainingArguments(
-        output_dir=str(output_dir),
-        logging_dir=str(logging_dir) if logging_dir is not None else None,
-        run_name=args.run_name or f"omniasr-{args.variant}",
-        overwrite_output_dir=False,
-        learning_rate=args.learning_rate,
-        max_steps=args.max_steps,
-        weight_decay=args.weight_decay,
-        max_grad_norm=args.max_grad_norm,
-        optim=args.optimizer,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        logging_strategy="steps",
-        logging_steps=args.logging_steps,
-        save_total_limit=args.save_total_limit,
-        fp16=args.fp16,
-        bf16=args.bf16,
-        gradient_checkpointing=args.gradient_checkpointing,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        metric_for_best_model=args.metric_for_best_model,
-        greater_is_better=args.greater_is_better,
-        load_best_model_at_end=args.load_best_model_at_end,
-        seed=args.seed,
-        data_seed=args.seed,
-        dataloader_num_workers=args.dataloader_num_workers,
-        report_to=args.report_to,
-        remove_unused_columns=args.remove_unused_columns,
-        group_by_length=args.group_by_length,
-        length_column_name=args.length_column_name,
-        label_names=["labels"],
-    )
-
-
-def build_optimizer_and_scheduler(
-    model: torch.nn.Module,
-    args: OmniASRTrainArgs,
-) -> Tuple[torch.optim.Optimizer, LambdaLR]:
-    no_decay = ("bias", "LayerNorm.weight", "layer_norm.weight")
-    decay_params: List[torch.nn.Parameter] = []
-    no_decay_params: List[torch.nn.Parameter] = []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
+    overrides: Optional[Dict[str, Any]] = None,
+) -> OmniASRTrainArgs:
+    cfg = load_yaml_config(yaml_path, variant=variant)
+    for k, v in dict(overrides or {}).items():
+        if v is None:
             continue
-        if any(nd in name for nd in no_decay):
-            no_decay_params.append(p)
-        else:
-            decay_params.append(p)
+        cfg[k] = v
+    valid_keys = set(OmniASRTrainArgs.__dataclass_fields__.keys())
+    filtered = {k: v for k, v in cfg.items() if k in valid_keys}
+    if "variant" not in filtered:
+        raise ValueError("Missing required OmniASR field: variant")
+    return OmniASRTrainArgs(**filtered)
 
-    param_groups = [
-        {"params": decay_params, "weight_decay": args.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
+
+# ---------------------------------------------------------------------------
+# Environment checks
+# ---------------------------------------------------------------------------
+
+
+def _check_fairseq2_available() -> None:
+    try:
+        import fairseq2  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "OmniASR training requires fairseq2 and the official "
+            "omnilingual-asr repo.  Install in a dedicated Colab "
+            "runtime, separate from the transformers stack:\n\n"
+            "    pip install -q fairseq2\n"
+            "    git clone https://github.com/facebookresearch/omnilingual-asr.git \\\n"
+            "        /content/omnilingual-asr\n"
+            "    pip install -e /content/omnilingual-asr\n\n"
+            f"Original ImportError: {exc}"
+        ) from exc
+
+
+def _resolve_meta_repo(args: OmniASRTrainArgs) -> Path:
+    candidate = (
+        Path(args.meta_repo_path) if args.meta_repo_path else DEFAULT_REPO_LOCAL
+    )
+    if not candidate.exists():
+        raise FileNotFoundError(
+            f"omnilingual-asr repo not found at {candidate}.\n\n"
+            "Clone it:\n"
+            "    git clone https://github.com/facebookresearch/omnilingual-asr.git "
+            f"{candidate}\n"
+            "    pip install -e " + str(candidate)
+        )
+    if not (candidate / "workflows" / "recipes" / "wav2vec2" / "asr").exists():
+        raise FileNotFoundError(
+            f"{candidate} exists but does not contain the expected "
+            "workflows/recipes/wav2vec2/asr/ directory.  Re-clone the "
+            "official repo."
+        )
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Manifest conversion + smoke truncation
+# ---------------------------------------------------------------------------
+
+
+def _convert_dataset_to_manifest(
+    args: OmniASRTrainArgs, manifest_dir: Path
+) -> None:
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    expected = [manifest_dir / f for f in
+                ("train.tsv", "train.wrd", "dev.tsv", "dev.wrd")]
+    if all(p.exists() for p in expected):
+        logger.info("Manifest cache present at %s; skipping conversion.",
+                    manifest_dir)
+        return
+    script = PROJECT_ROOT / "scripts" / "convert_to_omniasr_manifest.py"
+    if not script.exists():
+        raise FileNotFoundError(f"Conversion script not found: {script}")
+    cmd = [
+        sys.executable, str(script),
+        "--out_dir", str(manifest_dir),
+        "--sample_rate", str(args.sample_rate),
     ]
+    if args.hf_token:
+        cmd += ["--hf_token", args.hf_token]
+    logger.info("Running manifest conversion: %s", " ".join(cmd))
+    result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Manifest conversion failed (exit code {result.returncode})."
+        )
 
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        lr=args.learning_rate,
-        betas=(0.9, 0.999),
-        eps=1e-8,
+
+def _truncate_for_smoke(
+    manifest_dir: Path, n_train: int, n_dev: int
+) -> None:
+    for split, n in (("train", n_train), ("dev", n_dev)):
+        src_tsv = manifest_dir / f"{split}.tsv"
+        src_wrd = manifest_dir / f"{split}.wrd"
+        if not src_tsv.exists() or not src_wrd.exists():
+            raise FileNotFoundError(
+                f"Cannot build smoke manifest: missing {src_tsv} or {src_wrd}"
+            )
+        tsv_lines = src_tsv.read_text(encoding="utf-8").splitlines()
+        wrd_lines = src_wrd.read_text(encoding="utf-8").splitlines()
+        # tsv line 0 = audio root header; entries start at line 1.
+        smoke_tsv = manifest_dir / f"{split}.smoke.tsv"
+        smoke_wrd = manifest_dir / f"{split}.smoke.wrd"
+        smoke_tsv.write_text(
+            "\n".join([tsv_lines[0]] + tsv_lines[1:1 + n]) + "\n",
+            encoding="utf-8",
+        )
+        smoke_wrd.write_text(
+            "\n".join(wrd_lines[:n]) + "\n", encoding="utf-8"
+        )
+        logger.info(
+            "Smoke %s manifest: %d entries -> %s",
+            split, n, smoke_tsv,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Meta-schema YAML rendering
+# ---------------------------------------------------------------------------
+
+
+def _render_meta_yaml(
+    args: OmniASRTrainArgs,
+    template_path: Path,
+    manifest_dir: Path,
+    out_path: Path,
+) -> Path:
+    """Load the Meta-schema template, inject dataset paths + recipe
+    overrides, save the resolved YAML next to the run output dir."""
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(str(template_path))
+
+    suffix = ".smoke" if args.smoke else ""
+    train_tsv = (manifest_dir / f"train{suffix}.tsv").resolve()
+    train_wrd = (manifest_dir / f"train{suffix}.wrd").resolve()
+    dev_tsv   = (manifest_dir / f"dev{suffix}.tsv").resolve()
+    dev_wrd   = (manifest_dir / f"dev{suffix}.wrd").resolve()
+
+    OmegaConf.update(cfg, "dataset.splits.train.manifest", str(train_tsv))
+    OmegaConf.update(cfg, "dataset.splits.train.transcriptions", str(train_wrd))
+    OmegaConf.update(cfg, "dataset.splits.valid.manifest", str(dev_tsv))
+    OmegaConf.update(cfg, "dataset.splits.valid.transcriptions", str(dev_wrd))
+
+    if args.smoke:
+        OmegaConf.update(cfg, "trainer.max_num_steps", args.smoke_steps)
+        OmegaConf.update(cfg, "trainer.batch_size", 2)
+        OmegaConf.update(cfg, "trainer.grad_accumulation.num_batches", 1)
+        check_every = max(args.smoke_steps // 2, 5)
+        OmegaConf.update(cfg, "regime.checkpoint_every_n_steps", check_every)
+        OmegaConf.update(cfg, "regime.validate_every_n_steps", check_every)
+    else:
+        OmegaConf.update(cfg, "trainer.max_num_steps", args.max_num_steps)
+        OmegaConf.update(cfg, "trainer.batch_size", args.batch_size)
+        OmegaConf.update(cfg, "trainer.grad_accumulation.num_batches",
+                         args.grad_accumulation_num_batches)
+        OmegaConf.update(cfg, "regime.checkpoint_every_n_steps",
+                         args.checkpoint_every_n_steps)
+        OmegaConf.update(cfg, "regime.validate_every_n_steps",
+                         args.validate_every_n_steps)
+
+    OmegaConf.update(cfg, "optimizer.config.lr", float(args.learning_rate))
+    OmegaConf.update(cfg, "trainer.precision", args.precision)
+    OmegaConf.update(cfg, "scheduler.config.warmup_ratio",
+                     float(args.warmup_ratio))
+    OmegaConf.update(cfg, "scheduler.config.hold_ratio",
+                     float(args.hold_ratio))
+    OmegaConf.update(cfg, "trainer.seed", int(args.seed))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, str(out_path))
+    logger.info("Rendered Meta-schema YAML -> %s", out_path)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Resume support
+# ---------------------------------------------------------------------------
+
+
+def _detect_existing_checkpoint(output_dir: Path) -> Optional[Path]:
+    if not output_dir.exists():
+        return None
+    candidates = [
+        output_dir / "checkpoints" / "last.pt",
+        output_dir / "checkpoints" / "latest.pt",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    pts = sorted(
+        output_dir.rglob("checkpoint_*.pt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
     )
+    return pts[0] if pts else None
 
-    scheduler = build_tri_stage_scheduler(
-        optimizer,
-        total_steps=args.max_steps,
-        warmup_ratio=args.warmup_ratio,
-        hold_ratio=args.hold_ratio,
+
+def _find_best_checkpoint(output_dir: Path) -> Optional[Path]:
+    """Locate the best/latest fairseq2 checkpoint after a run completes."""
+    candidates = [
+        output_dir / "checkpoints" / "best.pt",
+        output_dir / "best.pt",
+        output_dir / "checkpoints" / "last.pt",
+        output_dir / "checkpoints" / "latest.pt",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    pts = sorted(output_dir.rglob("*.pt"),
+                 key=lambda p: p.stat().st_mtime, reverse=True)
+    return pts[0] if pts else None
+
+
+# ---------------------------------------------------------------------------
+# Recipe launch
+# ---------------------------------------------------------------------------
+
+
+def _launch_meta_recipe(
+    repo_path: Path,
+    output_dir: Path,
+    resolved_yaml: Path,
+) -> int:
+    cmd = [
+        sys.executable, "-m", RECIPE_MODULE,
+        str(output_dir),
+        "--config-file", str(resolved_yaml),
+    ]
+    logger.info("Launching Meta recipe:")
+    logger.info("  cwd = %s", repo_path)
+    logger.info("  cmd = %s", " ".join(cmd))
+    env = os.environ.copy()
+    # Ensure the Meta repo's package is importable when run via -m.
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(repo_path), env.get("PYTHONPATH", "")])
     )
+    proc = subprocess.run(cmd, cwd=str(repo_path), env=env)
+    return proc.returncode
 
-    return optimizer, scheduler
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 
 def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
+    """Launch the official Meta fairseq2 OmniASR fine-tuning recipe."""
     configure_logging()
     set_global_seed(args.seed, deterministic=args.deterministic)
 
@@ -410,120 +445,95 @@ def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
 
     if not args.output_dir or Path(args.output_dir) == Path("outputs"):
         args.output_dir = layout.checkpoint_dir(args.variant)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    args.output_dir = output_dir
+    args.output_dir = Path(args.output_dir)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
     final_dir = layout.final_model_dir(args.variant)
     tensorboard_dir = layout.tensorboard_dir(args.variant)
-
-    project_cfg = ProjectConfig(
-        dataset_name=args.dataset_name,
-        dataset_config=args.dataset_config,
-        audio_column=args.audio_column,
-        text_column=args.text_column,
-        sample_rate=args.sample_rate,
-        seed=args.seed,
-        deterministic=args.deterministic,
-        use_augmentation=args.use_augmentation,
-        preprocessed_dir=layout.preprocessed_dir("omniasr"),
-        dataset_cache_dir=layout.datasets_cache,
-        cache_dir=layout.cache,
-        min_train_audio_duration_sec=args.min_train_audio_duration_sec,
-    )
-    project_cfg.ensure_dirs()
-
-    logger.info("OmniASR fine-tuning — variant=%s", args.variant)
-    logger.info("Model:        %s", args.model_name_or_path)
-    logger.info("Checkpoints:  %s", output_dir)
-    logger.info("Final model:  %s", final_dir)
-    logger.info("TensorBoard:  %s", tensorboard_dir)
-
-    processor = build_processor(args)
-    processor.save_pretrained(output_dir)
-
-    model = build_model(args, processor)
-    dataset = prepare_dataset(args, processor, project_cfg)
-
-    aug_pipeline = build_augmentation_pipeline(
-        use_augmentation=args.use_augmentation,
-        sample_rate=args.sample_rate,
-        enable_waveform=False,
-        enable_specaugment=True,
-    )
-
-    collator = DataCollatorCTCWithPadding(
-        processor=processor,
-        padding=True,
-        augmentation=aug_pipeline,
-    )
-
-    metric_calculator = MetricCalculator()
-    compute_metrics = build_compute_metrics_ctc(
-        processor, metric_calculator=metric_calculator
-    )
-
-    training_args = build_training_args(args, logging_dir=tensorboard_dir)
-    callbacks = build_default_callbacks(
-        early_stopping_patience=args.early_stopping_patience,
-        early_stopping_threshold=args.early_stopping_threshold,
-    )
-
-    optimizer, scheduler = build_optimizer_and_scheduler(model, args)
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"],
-        data_collator=collator,
-        compute_metrics=compute_metrics,
-        processing_class=processor,
-        callbacks=callbacks,
-        optimizers=(optimizer, scheduler),
-    )
-
-    train_result = trainer.train(
-        resume_from_checkpoint=args.resume_from_checkpoint
-    )
-    trainer.save_state()
-    trainer.save_metrics("train", train_result.metrics)
-
+    manifest_dir = layout.preprocessed_dir("omniasr") / "manifest"
     final_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save_model(str(final_dir))
-    processor.save_pretrained(final_dir)
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
 
-    eval_metrics = trainer.evaluate(
-        eval_dataset=dataset["validation"],
-        metric_key_prefix="eval_final",
+    logger.info("=" * 70)
+    logger.info("OmniASR (fairseq2) fine-tuning — variant=%s", args.variant)
+    logger.info("Asset name      : %s", args.model_name_or_path)
+    logger.info("Checkpoints     : %s", args.output_dir)
+    logger.info("Final model     : %s", final_dir)
+    logger.info("TensorBoard     : %s", tensorboard_dir)
+    logger.info("Manifest dir    : %s", manifest_dir)
+    logger.info("Smoke           : %s", args.smoke)
+    logger.info("Storage root    : %s", layout.root)
+    logger.info("=" * 70)
+
+    # 1) Verify Meta runtime + repo.
+    _check_fairseq2_available()
+    repo_path = _resolve_meta_repo(args)
+
+    # 2) HF dataset -> fairseq2 manifest (cached).
+    _convert_dataset_to_manifest(args, manifest_dir)
+    if args.smoke:
+        _truncate_for_smoke(manifest_dir, args.smoke_train_size,
+                            args.smoke_dev_size)
+
+    # 3) Resolve Meta YAML template + render.
+    template_path = (
+        Path(args.meta_yaml_template) if args.meta_yaml_template
+        else DEFAULT_META_TEMPLATE
     )
-    trainer.save_metrics("eval_final", eval_metrics)
+    if not template_path.exists():
+        raise FileNotFoundError(
+            f"Meta recipe template not found: {template_path}"
+        )
+    resolved_yaml = args.output_dir / "ctc-finetune.resolved.yaml"
+    _render_meta_yaml(args, template_path, manifest_dir, resolved_yaml)
 
-    logger.info("Training complete. Final eval metrics: %s", eval_metrics)
-    return eval_metrics
-
-def args_from_yaml(
-    yaml_path: Union[str, Path],
-    variant: Optional[str] = None,
-    *,
-    overrides: Optional[Dict[str, Any]] = None,
-) -> OmniASRTrainArgs:
-    cfg = load_yaml_config(yaml_path, variant=variant)
-    overrides = dict(overrides or {})
-    for key, value in overrides.items():
-        if value is None:
-            continue
-        cfg[key] = value
-
-    valid_keys = set(OmniASRTrainArgs.__dataclass_fields__.keys())
-    filtered = {k: v for k, v in cfg.items() if k in valid_keys}
-
-    for required in ("model_name_or_path", "variant", "dataset_name"):
-        if required not in filtered:
-            raise ValueError(
-                f"Missing required OmniASR config field: {required}"
+    # 4) Resume detection (informational — fairseq2 auto-resumes from
+    #    the output_dir when checkpoints are present).
+    existing = _detect_existing_checkpoint(args.output_dir)
+    if args.resume_from_checkpoint:
+        if existing is not None:
+            logger.info(
+                "Resume hint '%s' acknowledged.  fairseq2 will auto-"
+                "resume from %s.",
+                args.resume_from_checkpoint, existing,
             )
-    return OmniASRTrainArgs(**filtered)
+        else:
+            logger.info(
+                "Resume hint '%s' acknowledged but no checkpoint found "
+                "under %s — starting fresh.",
+                args.resume_from_checkpoint, args.output_dir,
+            )
+    elif existing is not None:
+        logger.info("Found existing checkpoint %s — fairseq2 will resume.",
+                    existing)
+
+    # 5) Launch official recipe.
+    rc = _launch_meta_recipe(repo_path, args.output_dir, resolved_yaml)
+    if rc != 0:
+        raise RuntimeError(
+            f"Meta OmniASR recipe exited with code {rc}.  Inspect "
+            f"{args.output_dir} for the training log."
+        )
+
+    # 6) Copy best/last checkpoint to <final_models>/<variant>.pt
+    best = _find_best_checkpoint(args.output_dir)
+    if best is not None:
+        target = final_dir / f"{args.variant}.pt"
+        shutil.copy2(str(best), str(target))
+        logger.info("Copied final checkpoint to %s", target)
+    else:
+        logger.warning(
+            "No *.pt produced under %s; final_models directory left empty.",
+            args.output_dir,
+        )
+
+    logger.info("OmniASR fine-tuning complete.")
+    return {"recipe_exit_code": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 __all__ = [
@@ -531,13 +541,6 @@ __all__ = [
     "OmniASRProcessor",
     "OmniASRTrainArgs",
     "args_from_yaml",
-    "build_model",
-    "build_optimizer_and_scheduler",
-    "build_processor",
-    "build_training_args",
-    "build_tri_stage_scheduler",
     "load_yaml_config",
-    "prepare_dataset",
     "train_omniasr",
-    "tri_stage_lambda",
 ]
