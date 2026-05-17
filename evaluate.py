@@ -30,7 +30,7 @@ from metrics import (
     MetricCalculator,
     analyze_substitutions,
 )
-from preprocess import load_and_prepare
+from preprocess import decode_audio_entry, load_and_prepare
 from utils.text_normalization import build_default_normalizer
 
 logger = logging.getLogger(__name__)
@@ -516,7 +516,7 @@ def run_inference(
         audio_arrays: List[np.ndarray] = []
         for row in rows:
             audio = row[audio_column]
-            arr = np.asarray(audio["array"], dtype=np.float32)
+            arr, _ = decode_audio_entry(audio, sample_rate)
             audio_arrays.append(arr)
 
         batch = _build_input_batch(

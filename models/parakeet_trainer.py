@@ -36,7 +36,7 @@ from config import (
     set_global_seed,
 )
 from metrics import MetricCalculator, analyze_substitutions
-from preprocess import load_and_prepare
+from preprocess import decode_audio_entry, load_and_prepare
 from utils.text_normalization import build_default_normalizer
 
 logger = logging.getLogger(__name__)
@@ -206,13 +206,11 @@ def _materialize_manifest(
     with open(manifest_path, "w", encoding="utf-8") as fh:
         for i, example in enumerate(split):
             audio = example[audio_column]
-            samples = np.asarray(audio["array"], dtype=np.float32)
-            sr = int(audio.get("sampling_rate", sample_rate))
-            if sr != sample_rate:
-                raise ValueError(
-                    f"sample {i}: sample_rate={sr} != target {sample_rate}; "
-                    "ensure load_and_prepare cast to the target rate."
-                )
+            # decode_audio_entry handles both the legacy decoded form
+            # ``{"array": ..., "sampling_rate": ...}`` and the raw
+            # ``Audio(decode=False)`` form ``{"path": ..., "bytes": ...}``;
+            # it always returns mono float32 at ``sample_rate``.
+            samples, sr = decode_audio_entry(audio, sample_rate)
             wav_path = (wav_dir / f"{i:07d}.wav").resolve()
             if not wav_path.exists() or overwrite:
                 sf.write(str(wav_path), samples, sr, subtype="PCM_16")

@@ -35,6 +35,121 @@ from utils.text_normalization import TextNormalizer, build_default_normalizer
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# torchcodec-free audio decoding
+# ---------------------------------------------------------------------------
+#
+# ``datasets >= 3.0`` routes ``Audio`` decoding through torchcodec, which
+# is unreliable on current Colab Python 3.12 runtimes (ABI / FFmpeg
+# breakage).  We bypass that by casting the audio column with
+# ``decode=False`` and decoding ourselves via ``soundfile`` (and
+# ``librosa`` for mp3 / unusual codecs).  Both libraries are already
+# pinned in requirements.txt.
+#
+# The helpers also accept entries that *are* already decoded (with
+# ``array`` + ``sampling_rate``), so caches that pre-date this change
+# still work without invalidation.
+
+
+def _resample_to(arr: np.ndarray, orig_sr: int, target_sr: int) -> Tuple[np.ndarray, int]:
+    if orig_sr == target_sr:
+        return arr.astype(np.float32, copy=False), target_sr
+    import librosa  # already pinned
+    out = librosa.resample(
+        arr.astype(np.float32, copy=False),
+        orig_sr=orig_sr,
+        target_sr=target_sr,
+    )
+    return out.astype(np.float32, copy=False), target_sr
+
+
+def decode_audio_entry(
+    entry: Any, target_sr: int = TARGET_SAMPLE_RATE
+) -> Tuple[np.ndarray, int]:
+    """Return ``(samples_float32_mono, target_sr)`` for any audio entry.
+
+    Handles three forms transparently:
+      1. Decoded entry: ``{"array": np.ndarray, "sampling_rate": int}``
+         (datasets < 3.0 or ``decode=True``).
+      2. Raw entry: ``{"path": str, "bytes": Optional[bytes]}``
+         (``Audio(decode=False)``).
+      3. A bare path string.
+
+    Never imports torchcodec.
+    """
+    import io
+    import soundfile as sf
+
+    if isinstance(entry, dict) and entry.get("array") is not None:
+        arr = np.asarray(entry["array"], dtype=np.float32)
+        sr = int(entry.get("sampling_rate", target_sr))
+        if arr.ndim > 1:
+            arr = arr.mean(axis=-1).astype(np.float32)
+        return _resample_to(arr, sr, target_sr)
+
+    raw_bytes: Optional[bytes] = None
+    path: Optional[str] = None
+    if isinstance(entry, dict):
+        raw_bytes = entry.get("bytes")
+        path = entry.get("path")
+    elif isinstance(entry, (str, bytes, io.IOBase)):
+        path = entry  # type: ignore[assignment]
+
+    src: Any = io.BytesIO(raw_bytes) if raw_bytes is not None else path
+    if src is None:
+        raise ValueError(f"audio entry has neither array, bytes nor path: {entry!r}")
+
+    try:
+        arr, sr = sf.read(src, dtype="float32", always_2d=False)
+    except Exception as sf_exc:
+        try:
+            import librosa
+        except ImportError as li_exc:  # pragma: no cover
+            raise RuntimeError(
+                f"soundfile failed to decode audio ({sf_exc}) and "
+                "librosa is not installed for fallback decoding."
+            ) from li_exc
+        src_for_librosa = io.BytesIO(raw_bytes) if raw_bytes is not None else path
+        arr, sr = librosa.load(src_for_librosa, sr=None, mono=False)
+        arr = arr.astype(np.float32, copy=False)
+
+    if arr.ndim > 1:
+        arr = arr.mean(axis=-1).astype(np.float32)
+    return _resample_to(arr, int(sr), target_sr)
+
+
+def audio_length_samples(entry: Any, target_sr: int = TARGET_SAMPLE_RATE) -> Optional[int]:
+    """Return the number of samples at ``target_sr`` WITHOUT a full decode.
+
+    Uses ``soundfile.info`` for raw entries (reads header only) and
+    falls back to a full decode when the header path fails.  Returns
+    ``None`` when length is not measurable.
+    """
+    import io
+    import soundfile as sf
+
+    if isinstance(entry, dict) and entry.get("array") is not None:
+        arr = entry["array"]
+        sr = int(entry.get("sampling_rate", target_sr))
+        n = len(arr)
+        return int(round(n * target_sr / sr)) if sr != target_sr else int(n)
+
+    raw_bytes = entry.get("bytes") if isinstance(entry, dict) else None
+    path = entry.get("path") if isinstance(entry, dict) else None
+    try:
+        src = io.BytesIO(raw_bytes) if raw_bytes is not None else path
+        if src is None:
+            return None
+        info = sf.info(src)
+        return int(round(info.frames * target_sr / info.samplerate))
+    except Exception:
+        try:
+            arr, sr = decode_audio_entry(entry, target_sr)
+            return int(len(arr))
+        except Exception:
+            return None
+
+
 def detect_audio_column(
     columns: List[str], explicit: Optional[str] = None
 ) -> str:
@@ -185,12 +300,11 @@ def compute_duration_diagnostics(
         durations: List[float] = []
         for example in split_ds:
             audio = example[audio_column]
-            if isinstance(audio, dict) and "array" in audio:
-                arr = audio["array"]
-                sr = int(audio.get("sampling_rate", sample_rate))
-                durations.append(len(arr) / sr)
-            else:
+            n = audio_length_samples(audio, sample_rate)
+            if n is None:
                 durations.append(float("nan"))
+            else:
+                durations.append(n / sample_rate)
 
         arr = np.asarray(
             [d for d in durations if not np.isnan(d)], dtype=np.float64
@@ -287,10 +401,10 @@ def filter_short_audio(
         audio = example.get(audio_column)
         if audio is None:
             return False
-        if isinstance(audio, dict) and "array" in audio:
-            return len(audio["array"]) >= min_samples
-
-        return True
+        # ``audio_length_samples`` uses sf.info() on raw bytes — no
+        # full decode and no torchcodec involvement.
+        n = audio_length_samples(audio, sample_rate)
+        return n is None or n >= min_samples
 
     new_splits: Dict[str, Dataset] = {}
     for split_name, split_ds in ds.items():
@@ -338,8 +452,11 @@ def normalize_dataset(
             raise KeyError(
                 f"Split {split!r} is missing text column {text_column!r}"
             )
+        # ``decode=False`` keeps datasets out of the torchcodec code path.
+        # Decoding (and resampling) happens lazily inside
+        # ``decode_audio_entry`` via soundfile + librosa.
         ds[split] = ds[split].cast_column(
-            audio_column, Audio(sampling_rate=sample_rate)
+            audio_column, Audio(sampling_rate=sample_rate, decode=False)
         )
 
     def _normalize_text_row(batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -517,8 +634,7 @@ def prepare_for_model(
 
         def _process(example: Dict[str, Any]) -> Dict[str, Any]:
             audio = example[audio_column]
-            samples = np.asarray(audio["array"], dtype=np.float32)
-            sr = int(audio.get("sampling_rate", sample_rate))
+            samples, sr = decode_audio_entry(audio, sample_rate)
 
             if do_augment:
                 try:
