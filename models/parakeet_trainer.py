@@ -95,6 +95,39 @@ class ParakeetTrainArgs:
 # ---------------------------------------------------------------------------
 
 
+def _check_numpy_compat() -> None:
+    """Restore the deprecated capitalized NumPy aliases.
+
+    NumPy 2.0 removed ``np.Inf`` / ``np.NaN`` / ``np.Infinity`` /
+    ``np.PINF`` / ``np.NINF``.  ``pytorch_lightning <= 2.2.x``
+    (which is the range NeMo 1.23.x pins) still reads ``np.Inf`` in
+    ``ModelCheckpoint`` and a few metric initializers, raising::
+
+        AttributeError: `np.Inf` was removed in the NumPy 2.0 release.
+        Use `np.inf` instead.
+
+    The Lightning code path only *reads* these aliases — it never
+    writes to them — so re-attaching them as views onto the lower-
+    case versions is safe and fully reversible.  We do this only
+    inside the Parakeet pre-flight; the rest of the project never
+    touches the removed names.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return
+    if not hasattr(np, "Inf"):
+        np.Inf = np.inf
+    if not hasattr(np, "Infinity"):
+        np.Infinity = np.inf
+    if not hasattr(np, "PINF"):
+        np.PINF = np.inf
+    if not hasattr(np, "NINF"):
+        np.NINF = -np.inf
+    if not hasattr(np, "NaN"):
+        np.NaN = np.nan
+
+
 def _check_huggingface_hub_compat() -> None:
     """Monkeypatch ``HfFolder`` / ``ModelFilter`` onto ``huggingface_hub``.
 
@@ -222,6 +255,7 @@ def _check_torchvision_abi() -> None:
 
 
 def _load_nemo():
+    _check_numpy_compat()
     _check_torchvision_abi()
     _check_huggingface_hub_compat()
     try:
