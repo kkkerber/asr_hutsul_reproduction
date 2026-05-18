@@ -412,7 +412,20 @@ def _render_meta_yaml(
         OmegaConf.update(cfg, "dataset.asr_task_config.batch_size", 2)
         OmegaConf.update(cfg, "trainer.grad_accumulation.num_batches", 1)
         OmegaConf.update(cfg, "regime.num_steps", args.smoke_steps)
-        check_every = max(args.smoke_steps // 2, 5)
+        # fairseq2 requires checkpoint_every_n_steps and
+        # validate_every_n_steps to be multiples of
+        # publish_metrics_every_n_steps.  The template's default
+        # publish cadence is 200, which exceeds any reasonable smoke
+        # step count — override all three so the constraint holds and
+        # the smoke run actually emits metrics + checkpoints.
+        publish_every = max(1, args.smoke_steps // 10)
+        check_every = max(publish_every, args.smoke_steps // 2)
+        # Round up to the next multiple of publish_every.
+        check_every = (
+            (check_every + publish_every - 1) // publish_every
+        ) * publish_every
+        OmegaConf.update(cfg, "regime.publish_metrics_every_n_steps",
+                         publish_every)
         OmegaConf.update(cfg, "regime.checkpoint_every_n_steps", check_every)
         OmegaConf.update(cfg, "regime.validate_every_n_steps", check_every)
         OmegaConf.update(cfg, "regime.validate_after_n_steps", 0)
