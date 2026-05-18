@@ -30,9 +30,22 @@ defaults:
   meta_yaml_template: null
 
   # Paper-scale recipe settings (mirror what fairseq2 receives).
+  #
+  # A100 80GB throughput sizing
+  # ---------------------------
+  # Paper effective batch = 32.  With ``max_num_elements`` capped at a
+  # per-sample budget (the old launcher default), fairseq2's LENGTH
+  # batcher could only pack 3-4 average-length (8.3 s) samples per
+  # micro-batch, so the paper's 32 was never actually achieved and
+  # the GPU sat at ~7 GB on a 80GB A100.  The launcher now widens
+  # ``max_num_elements`` to ~300 s of audio per batch (see
+  # ``models/omniasr_trainer.py:_render_meta_yaml``), which combined
+  # with the values below produces a single physical batch of 32 —
+  # effective batch unchanged, four fewer forward passes per
+  # optimizer step.
   max_num_steps: 48000
-  grad_accumulation_num_batches: 4
-  batch_size: 8
+  grad_accumulation_num_batches: 1
+  batch_size: 32
   learning_rate: 5.0e-5
   warmup_ratio: 0.10
   hold_ratio: 0.40

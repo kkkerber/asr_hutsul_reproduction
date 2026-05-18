@@ -414,12 +414,26 @@ def _render_meta_yaml(
     OmegaConf.update(cfg, "dataset.name", asset_name)
 
     # 2) Audio-length / batching (samples, not seconds).
+    #
+    # ``max_audio_len``     = per-SAMPLE upper bound; oversize utterances
+    #                         are dropped.  30 s @ 16 kHz = 480_000.
+    # ``max_num_elements``  = per-BATCH frame budget for LENGTH batching.
+    #                         Must be >> max_audio_len, otherwise the
+    #                         bucket fills with a single long sample and
+    #                         batch_size never reaches paper value.  We
+    #                         set it to 300 s of audio (= 4_800_000
+    #                         samples at 16 kHz), which on A100 80GB fits
+    #                         the 32-sample paper batch with ~5x memory
+    #                         headroom for the heaviest mixed-length
+    #                         buckets.
     sr = int(args.sample_rate)
     min_samples = int(round(args.min_train_audio_duration_sec * sr))
-    max_samples = int(round(30.0 * sr))   # 30 s cap, paper convention
+    max_audio_len = int(round(30.0 * sr))
+    max_num_elements = int(round(300.0 * sr))
     OmegaConf.update(cfg, "dataset.asr_task_config.min_audio_len", min_samples)
-    OmegaConf.update(cfg, "dataset.asr_task_config.max_audio_len", max_samples)
-    OmegaConf.update(cfg, "dataset.asr_task_config.max_num_elements", max_samples)
+    OmegaConf.update(cfg, "dataset.asr_task_config.max_audio_len", max_audio_len)
+    OmegaConf.update(cfg, "dataset.asr_task_config.max_num_elements",
+                     max_num_elements)
     OmegaConf.update(cfg, "dataset.asr_task_config.normalize_audio", True)
 
     # 3) Per-mode trainer / regime overrides.
