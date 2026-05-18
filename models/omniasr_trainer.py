@@ -329,28 +329,49 @@ USER_ASSET_DIR = Path.home() / ".config" / "fairseq2" / "assets"
 
 
 def _register_manifest_asset_card(
-    asset_name: str, data_dir: Path
+    asset_name: str,
+    data_dir: Path,
+    tokenizer_ref: str = "omniASR_tokenizer_v1",
 ) -> Path:
     """Write a fairseq2 asset card so the recipe resolves
     ``dataset.name == asset_name`` to ``data_dir`` at runtime.
 
-    The card is rewritten on every launch so successive runs with
-    different storage roots stay consistent.  fairseq2's
-    ``register_dataset_family`` registers the family
-    ``manifest_asr_dataset`` (constant ``MANIFEST_ASR_DATASET`` in
-    ``omnilingual_asr.datasets.impl.manifest_asr_dataset``), so the
-    asset card's ``family`` field must match that string verbatim.
+    Schema verified against the official omnilingual-asr example::
+
+        name: example_dataset
+        dataset_family: manifest_asr_dataset
+        dataset_config:
+          data: /path/to/manifests
+          tokenizer_ref: omniASR_tokenizer_v1
+
+    Three constraints that the previous flat layout violated:
+
+    1. The field is ``dataset_family``, not ``family``.  fairseq2's
+       ``AssetCard`` validator raises::
+
+           AssetCardError: ... does not have a field named dataset_family
+
+       on the wrong key.
+    2. The dataset-config payload lives under a ``dataset_config:``
+       nested block, not at the top level.  ``data`` and
+       ``tokenizer_ref`` are fields of ``ManifestAsrDatasetConfig``,
+       which fairseq2 resolves via the nested block.
+    3. ``tokenizer_ref`` cross-references the tokenizer asset card
+       name (must match ``tokenizer.name`` in the recipe YAML).
     """
     USER_ASSET_DIR.mkdir(parents=True, exist_ok=True)
     card_path = USER_ASSET_DIR / f"{asset_name}.yaml"
     payload = (
         f"name: {asset_name}\n"
-        f"family: manifest_asr_dataset\n"
-        f"data: {data_dir.resolve()}\n"
+        f"dataset_family: manifest_asr_dataset\n"
+        f"dataset_config:\n"
+        f"  data: {data_dir.resolve()}\n"
+        f"  tokenizer_ref: {tokenizer_ref}\n"
     )
     card_path.write_text(payload, encoding="utf-8")
     logger.info(
-        "Wrote fairseq2 asset card -> %s  (data=%s)", card_path, data_dir
+        "Wrote fairseq2 asset card -> %s  (data=%s, tokenizer_ref=%s)",
+        card_path, data_dir, tokenizer_ref,
     )
     return card_path
 
