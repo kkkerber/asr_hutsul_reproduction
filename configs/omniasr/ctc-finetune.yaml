@@ -52,7 +52,12 @@ dataset:
     num_seqs_multiple_of: 1
     normalize_audio: true
     batch_shuffle_window: 1000
-    example_shuffle_window: 0
+    # fairseq2's AsrTask asserts ``example_shuffle_window > 0`` (the
+    # zero case triggers a full-dataset shuffle that can OOM).  1000
+    # gives meaningful windowed shuffling without unbounded memory
+    # growth — well within budget for the Hutsul corpus (~6.7k train
+    # samples after filtering).
+    example_shuffle_window: 1000
     num_prefetch: 4
     # SpecAugment (off by default; set spec_aug_p to enable).
     spec_aug_p: null
