@@ -276,7 +276,21 @@ def _convert_dataset_to_manifest(
 
 def _truncate_for_smoke(
     manifest_dir: Path, n_train: int, n_dev: int
-) -> None:
+) -> Path:
+    """Build a subdirectory ``<manifest_dir>/smoke/`` whose own
+    ``train.tsv`` / ``dev.tsv`` / ``train.wrd`` / ``dev.wrd`` contain
+    the first N rows of the corresponding parent file.
+
+    fairseq2's ``ManifestStorage.discover_splits`` scans the data
+    directory for files named ``<split>.tsv``, so the smoke variant
+    needs a directory of its own — the previous ``*.smoke.tsv``
+    filename scheme is invisible to that discovery.
+
+    Returns the path to the smoke directory (this is what the
+    fairseq2 asset card points at for the smoke variant).
+    """
+    smoke_dir = manifest_dir / "smoke"
+    smoke_dir.mkdir(parents=True, exist_ok=True)
     for split, n in (("train", n_train), ("dev", n_dev)):
         src_tsv = manifest_dir / f"{split}.tsv"
         src_wrd = manifest_dir / f"{split}.wrd"
@@ -286,20 +300,59 @@ def _truncate_for_smoke(
             )
         tsv_lines = src_tsv.read_text(encoding="utf-8").splitlines()
         wrd_lines = src_wrd.read_text(encoding="utf-8").splitlines()
-        # tsv line 0 = audio root header; entries start at line 1.
-        smoke_tsv = manifest_dir / f"{split}.smoke.tsv"
-        smoke_wrd = manifest_dir / f"{split}.smoke.wrd"
-        smoke_tsv.write_text(
+        # Line 0 of the parent TSV is an absolute audio-root path;
+        # copy it as-is so the relative wav names in the truncated
+        # rows still resolve.  No audio relocation needed.
+        (smoke_dir / f"{split}.tsv").write_text(
             "\n".join([tsv_lines[0]] + tsv_lines[1:1 + n]) + "\n",
             encoding="utf-8",
         )
-        smoke_wrd.write_text(
+        (smoke_dir / f"{split}.wrd").write_text(
             "\n".join(wrd_lines[:n]) + "\n", encoding="utf-8"
         )
         logger.info(
             "Smoke %s manifest: %d entries -> %s",
-            split, n, smoke_tsv,
+            split, n, smoke_dir / f"{split}.tsv",
         )
+    return smoke_dir
+
+
+# ---------------------------------------------------------------------------
+# fairseq2 asset-card registration
+# ---------------------------------------------------------------------------
+
+# fairseq2's user-asset directory.  The Meta recipe resolves
+# ``dataset.name`` via the AssetStore, which scans this directory
+# (plus paths in ``FAIRSEQ2_USER_ASSET_DIR``) for YAML files declaring
+# ``name: ...`` + ``family: manifest_asr_dataset`` + ``data: <path>``.
+USER_ASSET_DIR = Path.home() / ".config" / "fairseq2" / "assets"
+
+
+def _register_manifest_asset_card(
+    asset_name: str, data_dir: Path
+) -> Path:
+    """Write a fairseq2 asset card so the recipe resolves
+    ``dataset.name == asset_name`` to ``data_dir`` at runtime.
+
+    The card is rewritten on every launch so successive runs with
+    different storage roots stay consistent.  fairseq2's
+    ``register_dataset_family`` registers the family
+    ``manifest_asr_dataset`` (constant ``MANIFEST_ASR_DATASET`` in
+    ``omnilingual_asr.datasets.impl.manifest_asr_dataset``), so the
+    asset card's ``family`` field must match that string verbatim.
+    """
+    USER_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    card_path = USER_ASSET_DIR / f"{asset_name}.yaml"
+    payload = (
+        f"name: {asset_name}\n"
+        f"family: manifest_asr_dataset\n"
+        f"data: {data_dir.resolve()}\n"
+    )
+    card_path.write_text(payload, encoding="utf-8")
+    logger.info(
+        "Wrote fairseq2 asset card -> %s  (data=%s)", card_path, data_dir
+    )
+    return card_path
 
 
 # ---------------------------------------------------------------------------
@@ -310,50 +363,94 @@ def _truncate_for_smoke(
 def _render_meta_yaml(
     args: OmniASRTrainArgs,
     template_path: Path,
-    manifest_dir: Path,
+    asset_name: str,
     out_path: Path,
 ) -> Path:
-    """Load the Meta-schema template, inject dataset paths + recipe
-    overrides, save the resolved YAML next to the run output dir."""
+    """Load the Meta-schema template, inject only fields that exist in
+    ``Wav2Vec2AsrRecipeConfig``, save the resolved YAML next to the
+    run output dir.
+
+    The dataset manifest path is NOT a field of ``Wav2Vec2AsrDatasetSection``
+    — it lives in a fairseq2 asset card the launcher writes separately
+    (see :func:`_register_manifest_asset_card`).  This function only
+    overrides ``dataset.name`` so the recipe resolves the right card.
+
+    Verified valid OmegaConf paths (every other key that appeared in
+    the old launcher has been removed; the recipe's dataclass schema
+    rejects extras with the exact ``Recipe configuration cannot be
+    structured`` error we hit before):
+
+        dataset.name
+        dataset.asr_task_config.{min_audio_len,max_audio_len,
+                                 max_num_elements,batch_size,
+                                 normalize_audio}
+        optimizer.config.lr
+        lr_scheduler.config.stage_ratio
+        trainer.mixed_precision.dtype
+        trainer.grad_accumulation.num_batches
+        regime.{num_steps,checkpoint_every_n_steps,validate_every_n_steps,
+                validate_after_n_steps,publish_metrics_every_n_steps}
+    """
     from omegaconf import OmegaConf
 
     cfg = OmegaConf.load(str(template_path))
 
-    suffix = ".smoke" if args.smoke else ""
-    train_tsv = (manifest_dir / f"train{suffix}.tsv").resolve()
-    train_wrd = (manifest_dir / f"train{suffix}.wrd").resolve()
-    dev_tsv   = (manifest_dir / f"dev{suffix}.tsv").resolve()
-    dev_wrd   = (manifest_dir / f"dev{suffix}.wrd").resolve()
+    # 1) Asset-card key.
+    OmegaConf.update(cfg, "dataset.name", asset_name)
 
-    OmegaConf.update(cfg, "dataset.splits.train.manifest", str(train_tsv))
-    OmegaConf.update(cfg, "dataset.splits.train.transcriptions", str(train_wrd))
-    OmegaConf.update(cfg, "dataset.splits.valid.manifest", str(dev_tsv))
-    OmegaConf.update(cfg, "dataset.splits.valid.transcriptions", str(dev_wrd))
+    # 2) Audio-length / batching (samples, not seconds).
+    sr = int(args.sample_rate)
+    min_samples = int(round(args.min_train_audio_duration_sec * sr))
+    max_samples = int(round(30.0 * sr))   # 30 s cap, paper convention
+    OmegaConf.update(cfg, "dataset.asr_task_config.min_audio_len", min_samples)
+    OmegaConf.update(cfg, "dataset.asr_task_config.max_audio_len", max_samples)
+    OmegaConf.update(cfg, "dataset.asr_task_config.max_num_elements", max_samples)
+    OmegaConf.update(cfg, "dataset.asr_task_config.normalize_audio", True)
 
+    # 3) Per-mode trainer / regime overrides.
     if args.smoke:
-        OmegaConf.update(cfg, "trainer.max_num_steps", args.smoke_steps)
-        OmegaConf.update(cfg, "trainer.batch_size", 2)
+        OmegaConf.update(cfg, "dataset.asr_task_config.batch_size", 2)
         OmegaConf.update(cfg, "trainer.grad_accumulation.num_batches", 1)
+        OmegaConf.update(cfg, "regime.num_steps", args.smoke_steps)
         check_every = max(args.smoke_steps // 2, 5)
         OmegaConf.update(cfg, "regime.checkpoint_every_n_steps", check_every)
         OmegaConf.update(cfg, "regime.validate_every_n_steps", check_every)
+        OmegaConf.update(cfg, "regime.validate_after_n_steps", 0)
     else:
-        OmegaConf.update(cfg, "trainer.max_num_steps", args.max_num_steps)
-        OmegaConf.update(cfg, "trainer.batch_size", args.batch_size)
+        OmegaConf.update(cfg, "dataset.asr_task_config.batch_size",
+                         args.batch_size)
         OmegaConf.update(cfg, "trainer.grad_accumulation.num_batches",
                          args.grad_accumulation_num_batches)
+        OmegaConf.update(cfg, "regime.num_steps", args.max_num_steps)
         OmegaConf.update(cfg, "regime.checkpoint_every_n_steps",
                          args.checkpoint_every_n_steps)
         OmegaConf.update(cfg, "regime.validate_every_n_steps",
                          args.validate_every_n_steps)
 
+    # 4) Optimizer.
     OmegaConf.update(cfg, "optimizer.config.lr", float(args.learning_rate))
-    OmegaConf.update(cfg, "trainer.precision", args.precision)
-    OmegaConf.update(cfg, "scheduler.config.warmup_ratio",
-                     float(args.warmup_ratio))
-    OmegaConf.update(cfg, "scheduler.config.hold_ratio",
-                     float(args.hold_ratio))
-    OmegaConf.update(cfg, "trainer.seed", int(args.seed))
+
+    # 5) Mixed-precision dtype.  fairseq2 accepts a torch-prefixed
+    #    string; map our YAML's ``precision: float16|bfloat16|float32``
+    #    to the corresponding ``torch.<dtype>`` string.
+    _DTYPE_MAP = {
+        "float16":  "torch.float16",
+        "bfloat16": "torch.bfloat16",
+        "float32":  "torch.float32",
+    }
+    dtype_str = _DTYPE_MAP.get(args.precision, "torch.float16")
+    OmegaConf.update(cfg, "trainer.mixed_precision.dtype", dtype_str)
+
+    # 6) Tri-stage LR scheduler.  TriStageLRConfig uses ``stage_ratio``
+    #    (a 3-tuple summing to 1.0), NOT separate warmup/hold/decay
+    #    fields.  Our project-level YAML exposes warmup_ratio +
+    #    hold_ratio so we derive the third stage.
+    warmup = float(args.warmup_ratio)
+    hold   = float(args.hold_ratio)
+    decay  = max(0.0, 1.0 - warmup - hold)
+    OmegaConf.update(
+        cfg, "lr_scheduler.config.stage_ratio", [warmup, hold, decay]
+    )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, str(out_path))
@@ -471,11 +568,19 @@ def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
 
     # 2) HF dataset -> fairseq2 manifest (cached).
     _convert_dataset_to_manifest(args, manifest_dir)
+    data_dir_for_recipe = manifest_dir
     if args.smoke:
-        _truncate_for_smoke(manifest_dir, args.smoke_train_size,
-                            args.smoke_dev_size)
+        data_dir_for_recipe = _truncate_for_smoke(
+            manifest_dir, args.smoke_train_size, args.smoke_dev_size,
+        )
 
-    # 3) Resolve Meta YAML template + render.
+    # 3) Register a fairseq2 asset card so the recipe can resolve
+    #    ``dataset.name`` to the manifest directory.  The asset name
+    #    is per-variant so smoke and paper-scale runs do not collide.
+    asset_name = f"hutsul_omniasr_{args.variant.replace('-', '_')}"
+    _register_manifest_asset_card(asset_name, data_dir_for_recipe)
+
+    # 4) Resolve Meta YAML template + render.
     template_path = (
         Path(args.meta_yaml_template) if args.meta_yaml_template
         else DEFAULT_META_TEMPLATE
@@ -485,7 +590,7 @@ def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
             f"Meta recipe template not found: {template_path}"
         )
     resolved_yaml = args.output_dir / "ctc-finetune.resolved.yaml"
-    _render_meta_yaml(args, template_path, manifest_dir, resolved_yaml)
+    _render_meta_yaml(args, template_path, asset_name, resolved_yaml)
 
     # 4) Resume detection (informational — fairseq2 auto-resumes from
     #    the output_dir when checkpoints are present).

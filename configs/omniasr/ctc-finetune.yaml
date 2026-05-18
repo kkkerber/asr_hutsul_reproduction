@@ -1,74 +1,88 @@
 # Meta-schema YAML template for the official fairseq2 OmniASR recipe.
 #
-# This file is consumed VERBATIM by
+# Consumed verbatim by
 #   python -m workflows.recipes.wav2vec2.asr <out_dir> --config-file <this>
-# after ``models/omniasr_trainer.py`` injects the dataset manifest
-# paths via OmegaConf.update and writes a resolved copy next to the
-# run output_dir.
+# after ``models/omniasr_trainer.py`` overrides ``dataset.name`` to
+# point at the per-variant fairseq2 asset card it writes to
+# ``~/.config/fairseq2/assets/<name>.yaml`` (the asset card maps the
+# name to the actual manifest directory).
 #
-# Schema verified from:
-#   * official ctc-finetune.yaml in workflows/recipes/wav2vec2/asr/configs/
-#   * asset card omnilingual-asr/src/omnilingual_asr/cards/models/rc_models_v1.yaml
+# Schema verified against:
+#   workflows/recipes/wav2vec2/asr/default_config.py
+#       Wav2Vec2AsrRecipeConfig / Wav2Vec2AsrDatasetSection
+#       Wav2Vec2AsrTrainerSection
+#   workflows/recipes/wav2vec2/asr/configs/ctc-finetune.yaml
+#   src/omnilingual_asr/datasets/storage/manifest_storage.py
+#       ManifestStorageConfig {read_text, cached_fd_count}
+#   src/omnilingual_asr/datasets/tasks/asr_task.py
+#       AsrTaskConfig
+#   src/omnilingual_asr/datasets/impl/manifest_asr_dataset.py
+#       MANIFEST_ASR_DATASET = "manifest_asr_dataset"
+#       ManifestAsrDatasetConfig {data: Path}
 #
-# Field names match what the official recipe expects.  When the
-# upstream recipe schema evolves, update this template (not the
-# Python launcher).
+# Audio-length fields are in SAMPLES (int), not seconds.  At 16 kHz:
+#   1.0 s  =      16_000 samples
+#   30.0 s =     480_000 samples
+#   60.0 s =     960_000 samples
 
 model:
-  name: omniASR_CTC_300M
+  name: "omniASR_CTC_300M"
 
 tokenizer:
-  name: omniASR_tokenizer_v1
+  name: "omniASR_tokenizer_v1"
 
 dataset:
-  # ManifestAsrDataset configuration — keys injected by the launcher.
-  name: manifest_asr
-  splits:
-    train:
-      manifest: __PLACEHOLDER_TRAIN_TSV__
-      transcriptions: __PLACEHOLDER_TRAIN_WRD__
-    valid:
-      manifest: __PLACEHOLDER_DEV_TSV__
-      transcriptions: __PLACEHOLDER_DEV_WRD__
-  sample_rate: 16000
-  min_audio_len_seconds: 1.0
-  max_audio_len_seconds: 30.0
-  normalize_audio: true
+  # ``name`` is the asset-card key; ``models/omniasr_trainer.py``
+  # rewrites this at render time to a per-variant string and writes
+  # the matching asset card under ``~/.config/fairseq2/assets/``.
+  name: "__PLACEHOLDER_ASSET_NAME__"
+  train_split: "train"
+  valid_split: "dev"
+  storage_mode: "MANIFEST"
+  task_mode: "ASR"
+  manifest_storage_config:
+    read_text: true
+    cached_fd_count: 1000
+  asr_task_config:
+    min_audio_len: 16_000        # 1.0 s @ 16 kHz
+    max_audio_len: 480_000       # 30.0 s @ 16 kHz
+    max_num_elements: 480_000
+    batch_size: 8
+    batching_strategy: "LENGTH"
+    num_seqs_multiple_of: 1
+    normalize_audio: true
+    batch_shuffle_window: 1000
+    example_shuffle_window: 0
+    num_prefetch: 4
+    # SpecAugment (off by default; set spec_aug_p to enable).
+    spec_aug_p: null
+    spec_aug_freq_mask_param: 80
+    spec_aug_time_mask_param: 80
 
 optimizer:
-  name: adamw
   config:
-    lr: 5.0e-5
-    weight_decay: 1.0e-3
+    lr: 5.0e-05
     betas: [0.9, 0.98]
+    eps: 1.0e-08
+    weight_decay: 0.0
 
-scheduler:
-  name: tri_stage
+lr_scheduler:
   config:
-    warmup_ratio: 0.10
-    hold_ratio: 0.40
-    final_lr_scale: 0.01
+    stage_ratio: [0.1, 0.4, 0.5]
+    start_lr_scale: 0.01
+    final_lr_scale: 0.05
 
 trainer:
-  max_num_steps: 48000
+  freeze_encoder_for_n_steps: 0
+  mixed_precision:
+    dtype: "torch.float16"
   grad_accumulation:
     num_batches: 4
-  batch_size: 8
-  precision: float16
-  gradient_clip_norm: 1.0
-  seed: 42
 
 regime:
-  checkpoint_every_n_steps: 1000
+  num_steps: 48_000
+  score_metric: "wer"
+  validate_after_n_steps: 0
   validate_every_n_steps: 1000
-
-# SpecAugment is supported by the recipe's AsrTask.  Conservative
-# defaults; the launcher does not currently override this block, so
-# edit here to tune.
-augmentation:
-  spec_augment:
-    enabled: true
-    time_mask_count: 2
-    time_mask_max_size: 40
-    freq_mask_count: 2
-    freq_mask_max_size: 27
+  checkpoint_every_n_steps: 1000
+  publish_metrics_every_n_steps: 200
