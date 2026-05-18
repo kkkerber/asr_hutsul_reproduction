@@ -44,8 +44,8 @@ defaults:
   # effective batch unchanged, four fewer forward passes per
   # optimizer step.
   max_num_steps: 48000
-  grad_accumulation_num_batches: 1
-  batch_size: 32
+  grad_accumulation_num_batches: 4
+  batch_size: 8
   learning_rate: 5.0e-5
   warmup_ratio: 0.10
   hold_ratio: 0.40
