@@ -439,7 +439,7 @@ def _render_meta_yaml(
     sr = int(args.sample_rate)
     min_samples = int(round(args.min_train_audio_duration_sec * sr))
     max_audio_len = int(round(30.0 * sr))
-    max_num_elements = int(round(300.0 * sr))
+    max_num_elements = int(round(30.0 * sr))
     OmegaConf.update(cfg, "dataset.asr_task_config.min_audio_len", min_samples)
     OmegaConf.update(cfg, "dataset.asr_task_config.max_audio_len", max_audio_len)
     OmegaConf.update(cfg, "dataset.asr_task_config.max_num_elements",
