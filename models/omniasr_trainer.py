@@ -410,6 +410,16 @@ def _render_meta_yaml(
 
     cfg = OmegaConf.load(str(template_path))
 
+    # 0) Disable fairseq2's sweep-dir hashing so checkpoints land at a
+    #    DETERMINISTIC path: <output_dir>/checkpoints/step_<N>/ rather
+    #    than <output_dir>/ws_<world>.<hash>/checkpoints/step_<N>/.
+    #    Without this, every re-launch can produce a different
+    #    ws_<hash> (the hash depends on the resolved recipe config),
+    #    so fairseq2's auto-resume scan never finds the previous
+    #    workspace's checkpoints and training restarts from scratch.
+    #    See ``CommonSection.no_sweep_dir`` in fairseq2/recipe/config.py.
+    OmegaConf.update(cfg, "common.no_sweep_dir", True)
+
     # 1) Asset-card key.
     OmegaConf.update(cfg, "dataset.name", asset_name)
 
@@ -505,38 +515,84 @@ def _render_meta_yaml(
 # ---------------------------------------------------------------------------
 
 
-def _detect_existing_checkpoint(output_dir: Path) -> Optional[Path]:
+def _find_latest_step_dir(output_dir: Path) -> Optional[Path]:
+    """Locate fairseq2's most recent ``step_<N>/`` checkpoint directory.
+
+    Scans both possible layouts:
+
+    1. **Deterministic** (current, after this launcher disables sweep
+       dirs via ``common.no_sweep_dir = True``)::
+
+           <output_dir>/checkpoints/step_<N>/
+
+    2. **Legacy sweep** (created by earlier runs that did not set
+       ``no_sweep_dir``; the hash subdir was the cause of the bogus
+       "starting fresh" behaviour)::
+
+           <output_dir>/ws_<world>.<hash>/checkpoints/step_<N>/
+
+    Returns the ``step_<N>/`` directory with the highest ``N`` across
+    all workspaces, or ``None`` if no checkpoint exists.  The
+    parent of the returned path is what fairseq2 needs to read for
+    auto-resume; passing the parent dir back to the recipe via
+    ``--checkpoint-dir`` covers the legacy-layout case (so users who
+    have a checkpoint in ``ws_<hash>/`` from a pre-fix run can still
+    resume it).
+    """
     if not output_dir.exists():
         return None
-    candidates = [
-        output_dir / "checkpoints" / "last.pt",
-        output_dir / "checkpoints" / "latest.pt",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    pts = sorted(
-        output_dir.rglob("checkpoint_*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return pts[0] if pts else None
+
+    candidates: List[tuple[int, float, Path]] = []
+
+    # Layout 1: <output_dir>/checkpoints/step_<N>/
+    flat_root = output_dir / "checkpoints"
+    if flat_root.is_dir():
+        for step in flat_root.glob("step_*"):
+            if not step.is_dir():
+                continue
+            try:
+                n = int(step.name.split("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            candidates.append((n, step.stat().st_mtime, step))
+
+    # Layout 2: <output_dir>/ws_<id>/checkpoints/step_<N>/
+    for ws in output_dir.glob("ws_*"):
+        ws_ckpts = ws / "checkpoints"
+        if not ws_ckpts.is_dir():
+            continue
+        for step in ws_ckpts.glob("step_*"):
+            if not step.is_dir():
+                continue
+            try:
+                n = int(step.name.split("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            candidates.append((n, step.stat().st_mtime, step))
+
+    if not candidates:
+        return None
+    # Sort by step number primarily; mtime breaks ties between
+    # equal-step checkpoints across different workspaces.
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    return candidates[-1][2]
+
+
+def _detect_existing_checkpoint(output_dir: Path) -> Optional[Path]:
+    """Public alias used by the resume log line in ``train_omniasr``."""
+    return _find_latest_step_dir(output_dir)
 
 
 def _find_best_checkpoint(output_dir: Path) -> Optional[Path]:
-    """Locate the best/latest fairseq2 checkpoint after a run completes."""
-    candidates = [
-        output_dir / "checkpoints" / "best.pt",
-        output_dir / "best.pt",
-        output_dir / "checkpoints" / "last.pt",
-        output_dir / "checkpoints" / "latest.pt",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    pts = sorted(output_dir.rglob("*.pt"),
-                 key=lambda p: p.stat().st_mtime, reverse=True)
-    return pts[0] if pts else None
+    """Post-training: locate the directory to export into
+    ``final_models/<variant>/``.  fairseq2's standard recipe writes
+    one ``step_<N>/`` per save point and keeps the best-scoring one
+    under the same name (``keep_best_n_checkpoints`` semantics handled
+    by the recipe).  We pick the latest surviving ``step_<N>/`` —
+    after ``keep_best_n_checkpoints`` pruning runs, that is the
+    best-and-most-recent retained checkpoint.
+    """
+    return _find_latest_step_dir(output_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -548,12 +604,25 @@ def _launch_meta_recipe(
     repo_path: Path,
     output_dir: Path,
     resolved_yaml: Path,
+    checkpoint_dir: Optional[Path] = None,
 ) -> int:
+    """Invoke ``python -m workflows.recipes.wav2vec2.asr``.
+
+    If ``checkpoint_dir`` is supplied, pass it through fairseq2's
+    ``--checkpoint-dir`` CLI flag (declared in
+    ``fairseq2/recipe/cli.py``).  This is used to point the recipe at
+    an existing legacy ``<output_dir>/ws_<hash>/checkpoints/`` so it
+    auto-resumes from a checkpoint produced by a pre-fix run, even
+    though new runs save to the deterministic
+    ``<output_dir>/checkpoints/`` location via ``common.no_sweep_dir``.
+    """
     cmd = [
         sys.executable, "-m", RECIPE_MODULE,
         str(output_dir),
         "--config-file", str(resolved_yaml),
     ]
+    if checkpoint_dir is not None:
+        cmd += ["--checkpoint-dir", str(checkpoint_dir)]
     logger.info("Launching Meta recipe:")
     logger.info("  cwd = %s", repo_path)
     logger.info("  cmd = %s", " ".join(cmd))
@@ -636,41 +705,79 @@ def train_omniasr(args: OmniASRTrainArgs) -> Dict[str, float]:
 
     # 4) Resume detection (informational — fairseq2 auto-resumes from
     #    the output_dir when checkpoints are present).
+    # fairseq2 layout (set by ``common.no_sweep_dir = True`` in the
+    # rendered YAML): <output_dir>/checkpoints/step_<N>/
+    # Legacy layout from runs before this fix:
+    #     <output_dir>/ws_<world>.<hash>/checkpoints/step_<N>/
     existing = _detect_existing_checkpoint(args.output_dir)
-    if args.resume_from_checkpoint:
-        if existing is not None:
+    legacy_checkpoint_dir: Optional[Path] = None
+    if existing is not None:
+        # ``existing`` is the step_<N>/ directory itself; its parent
+        # is the checkpoint root fairseq2 needs to scan.
+        ckpt_root = existing.parent           # e.g. ws_*/checkpoints  or  checkpoints
+        in_sweep = (ckpt_root.parent.name.startswith("ws_")
+                    and ckpt_root.parent.parent == args.output_dir)
+        in_deterministic = (ckpt_root.parent == args.output_dir
+                            and ckpt_root.name == "checkpoints")
+        if in_sweep:
+            # Pre-fix checkpoint lives in a hashed sweep dir.  Point
+            # the recipe at that dir explicitly via --checkpoint-dir.
+            legacy_checkpoint_dir = ckpt_root
             logger.info(
-                "Resume hint '%s' acknowledged.  fairseq2 will auto-"
-                "resume from %s.",
-                args.resume_from_checkpoint, existing,
+                "Resuming from LEGACY sweep checkpoint: %s "
+                "(passing via --checkpoint-dir)",
+                existing,
+            )
+        elif in_deterministic:
+            # New deterministic layout — fairseq2's auto-resume scan
+            # of <output_dir>/checkpoints/ picks this up natively.
+            logger.info(
+                "Resuming from %s (fairseq2 auto-resume via "
+                "<output_dir>/checkpoints/).",
+                existing,
             )
         else:
+            logger.info(
+                "Detected checkpoint at %s but layout is unrecognised; "
+                "letting fairseq2 attempt auto-resume.", existing,
+            )
+    else:
+        if args.resume_from_checkpoint:
             logger.info(
                 "Resume hint '%s' acknowledged but no checkpoint found "
                 "under %s — starting fresh.",
                 args.resume_from_checkpoint, args.output_dir,
             )
-    elif existing is not None:
-        logger.info("Found existing checkpoint %s — fairseq2 will resume.",
-                    existing)
+        else:
+            logger.info("No prior checkpoint under %s — starting fresh.",
+                        args.output_dir)
 
-    # 5) Launch official recipe.
-    rc = _launch_meta_recipe(repo_path, args.output_dir, resolved_yaml)
+    # 5) Launch official recipe (with legacy --checkpoint-dir if needed).
+    rc = _launch_meta_recipe(
+        repo_path, args.output_dir, resolved_yaml,
+        checkpoint_dir=legacy_checkpoint_dir,
+    )
     if rc != 0:
         raise RuntimeError(
             f"Meta OmniASR recipe exited with code {rc}.  Inspect "
             f"{args.output_dir} for the training log."
         )
 
-    # 6) Copy best/last checkpoint to <final_models>/<variant>.pt
+    # 6) Copy the latest retained step_<N>/ checkpoint dir into
+    #    <final_models>/<variant>/.  fairseq2 stores each save point
+    #    as a directory (model state + optimizer + meta), not a
+    #    single .pt file, so we copytree rather than copy a file.
     best = _find_best_checkpoint(args.output_dir)
     if best is not None:
-        target = final_dir / f"{args.variant}.pt"
-        shutil.copy2(str(best), str(target))
-        logger.info("Copied final checkpoint to %s", target)
+        target = final_dir / best.name      # e.g. step_48000
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(str(best), str(target))
+        logger.info("Copied final checkpoint dir to %s", target)
     else:
         logger.warning(
-            "No *.pt produced under %s; final_models directory left empty.",
+            "No step_<N>/ checkpoint produced under %s; "
+            "final_models directory left empty.",
             args.output_dir,
         )
 
