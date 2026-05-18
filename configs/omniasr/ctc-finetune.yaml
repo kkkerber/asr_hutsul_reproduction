@@ -85,7 +85,7 @@ trainer:
     num_batches: 4
 
 regime:
-  num_steps: 48_000
+  num_steps: 10_000
   score_metric: "wer"
   validate_after_n_steps: 0
   validate_every_n_steps: 1000
