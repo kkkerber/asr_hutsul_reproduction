@@ -329,35 +329,31 @@ USER_ASSET_DIR = Path.home() / ".config" / "fairseq2" / "assets"
 
 
 def _register_manifest_asset_card(
-    asset_name: str,
-    data_dir: Path,
-    tokenizer_ref: str = "omniASR_tokenizer_v1",
+    asset_name: str, data_dir: Path
 ) -> Path:
     """Write a fairseq2 asset card so the recipe resolves
     ``dataset.name == asset_name`` to ``data_dir`` at runtime.
 
-    Schema verified against the official omnilingual-asr example::
+    Schema (verified against
+    ``src/omnilingual_asr/datasets/impl/manifest_asr_dataset.py``)::
 
-        name: example_dataset
+        @dataclass
+        class ManifestAsrDatasetConfig:
+            data: Path
+
+    ``dataset_config`` therefore accepts EXACTLY one field: ``data``.
+    A previous version of this writer also emitted ``tokenizer_ref``
+    under the nested block; fairseq2's ``AssetCard.parse_as`` rejected
+    that with ``extra keys tokenizer_ref``.  The tokenizer is already
+    declared in the recipe YAML via ``tokenizer.name``; the dataset
+    asset card does not cross-reference it.
+
+    Asset-card-level layout (also verified by the same load path):
+
+        name: <asset_name>
         dataset_family: manifest_asr_dataset
         dataset_config:
-          data: /path/to/manifests
-          tokenizer_ref: omniASR_tokenizer_v1
-
-    Three constraints that the previous flat layout violated:
-
-    1. The field is ``dataset_family``, not ``family``.  fairseq2's
-       ``AssetCard`` validator raises::
-
-           AssetCardError: ... does not have a field named dataset_family
-
-       on the wrong key.
-    2. The dataset-config payload lives under a ``dataset_config:``
-       nested block, not at the top level.  ``data`` and
-       ``tokenizer_ref`` are fields of ``ManifestAsrDatasetConfig``,
-       which fairseq2 resolves via the nested block.
-    3. ``tokenizer_ref`` cross-references the tokenizer asset card
-       name (must match ``tokenizer.name`` in the recipe YAML).
+          data: <absolute path to manifest dir>
     """
     USER_ASSET_DIR.mkdir(parents=True, exist_ok=True)
     card_path = USER_ASSET_DIR / f"{asset_name}.yaml"
@@ -366,12 +362,10 @@ def _register_manifest_asset_card(
         f"dataset_family: manifest_asr_dataset\n"
         f"dataset_config:\n"
         f"  data: {data_dir.resolve()}\n"
-        f"  tokenizer_ref: {tokenizer_ref}\n"
     )
     card_path.write_text(payload, encoding="utf-8")
     logger.info(
-        "Wrote fairseq2 asset card -> %s  (data=%s, tokenizer_ref=%s)",
-        card_path, data_dir, tokenizer_ref,
+        "Wrote fairseq2 asset card -> %s  (data=%s)", card_path, data_dir
     )
     return card_path
 
