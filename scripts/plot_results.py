@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -142,6 +143,17 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _safe_float(value: Any) -> float:
+    """Coerce to float; default NaN on None / invalid.  Required for the
+    OmniASR JSON path which emits ``null`` for unlogged metrics."""
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _collect_results(json_root: Path) -> List[RunResult]:
     out: List[RunResult] = []
     if not json_root.exists():
@@ -158,8 +170,8 @@ def _collect_results(json_root: Path) -> List[RunResult]:
                     family=str(data.get("model_family", "")),
                     split=str(data.get("split", "")),
                     n_samples=int(data.get("num_samples", 0) or 0),
-                    wer=float(data["wer"]),
-                    cer=float(data["cer"]),
+                    wer=_safe_float(data.get("wer")),
+                    cer=_safe_float(data.get("cer")),
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -183,10 +195,11 @@ def plot_wer_cer_bar(rows: Sequence[RunResult], out_path: Path) -> None:
     if not rows:
         return
 
-    rows = sorted(rows, key=lambda r: r.cer)
+    # Sort by CER (treating NaN as +inf so CER-missing rows sort last).
+    rows = sorted(rows, key=lambda r: (math.isnan(r.cer), r.cer))
     variants = [r.run for r in rows]
-    wer_pct = np.array([r.wer * 100 for r in rows])
-    cer_pct = np.array([r.cer * 100 for r in rows])
+    wer_pct = np.array([r.wer * 100 for r in rows], dtype=float)
+    cer_pct = np.array([r.cer * 100 for r in rows], dtype=float)
     x = np.arange(len(variants))
     width = 0.40
 
@@ -205,7 +218,12 @@ def plot_wer_cer_bar(rows: Sequence[RunResult], out_path: Path) -> None:
         edgecolor="white", linewidth=0.6,
     )
 
-    ymax = float(max(wer_pct.max(), cer_pct.max())) if len(rows) else 1.0
+    # NaN-safe y-axis bound — matplotlib refuses NaN/Inf limits.
+    finite = np.concatenate([
+        wer_pct[np.isfinite(wer_pct)],
+        cer_pct[np.isfinite(cer_pct)],
+    ])
+    ymax = float(finite.max()) if finite.size else 1.0
     ax.set_ylim(0, ymax * 1.15 + 1.0)
     ax.set_xticks(x)
     ax.set_xticklabels(variants, rotation=25, ha="right")
@@ -217,17 +235,23 @@ def plot_wer_cer_bar(rows: Sequence[RunResult], out_path: Path) -> None:
     )
     ax.legend(loc="upper right")
 
+    # NaN values produce no bar height; skip the label rather than print
+    # "nan" over an invisible bar.
     for bar, value in zip(bars_w, wer_pct):
+        if math.isnan(value):
+            continue
         ax.text(
             bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + ymax * 0.015,
+            value + ymax * 0.015,
             f"{value:.1f}",
             ha="center", va="bottom", fontsize=8,
         )
     for bar, value in zip(bars_c, cer_pct):
+        if math.isnan(value):
+            continue
         ax.text(
             bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + ymax * 0.015,
+            value + ymax * 0.015,
             f"{value:.1f}",
             ha="center", va="bottom", fontsize=8,
         )

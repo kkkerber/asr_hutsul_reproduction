@@ -156,13 +156,27 @@ def _build_row(run_dir: Path) -> Optional[EvalRow]:
         error_analysis.get("dialect_pairs", {}) or {}
     )
 
+    def _safe_float(value: Any) -> float:
+        """Coerce to float, defaulting to NaN on None / invalid / inf.
+
+        Required because ``scripts/evaluate_omniasr.py`` emits JSON
+        ``null`` for missing WER/CER (correct per RFC 8259 — fairseq2's
+        CER is not always logged), and a plain ``float(None)`` raises.
+        """
+        if value is None:
+            return float("nan")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
     return EvalRow(
         run=run_dir.name,
         family=str(test_results.get("model_family", "") or ""),
         split=str(test_results.get("split", "") or ""),
         n_samples=int(test_results.get("num_samples", 0) or 0),
-        wer=float(test_results.get("wer", float("nan"))),
-        cer=float(test_results.get("cer", float("nan"))),
+        wer=_safe_float(test_results.get("wer")),
+        cer=_safe_float(test_results.get("cer")),
         checkpoint=str(test_results.get("checkpoint", "") or ""),
         base_model_id=test_results.get("base_model_id"),
         is_peft=bool(test_results.get("is_peft", False)),
