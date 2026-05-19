@@ -121,7 +121,20 @@ def _load_event_accumulator(tb_dir: Path):
     if not candidates:
         return None
 
-    acc = EventAccumulator(str(candidates[0]), size_guidance={"scalars": 0})
+    preferred = None
+
+    for c in candidates:
+        if "valid" in str(c).lower():
+            preferred = c
+            break
+
+    if preferred is None:
+        preferred = candidates[0]
+
+    acc = EventAccumulator(
+        str(preferred),
+        size_guidance={"scalars": 0}
+    )
     acc.Reload()
     return acc
 
