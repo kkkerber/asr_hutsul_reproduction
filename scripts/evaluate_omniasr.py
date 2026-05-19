@@ -295,7 +295,7 @@ def evaluate_omniasr(
     layout: StorageLayout,
     variant: str,
 ) -> int:
-    tb_dir = layout.tensorboard_dir(variant)
+    tb_dir = layout.checkpoint_dir(variant) / "tb"
     if not tb_dir.exists():
         logger.error(
             "TensorBoard directory %s does not exist — was %s trained "
