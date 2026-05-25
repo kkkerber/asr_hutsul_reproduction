@@ -154,12 +154,25 @@ def _safe_float(value: Any) -> float:
         return float("nan")
 
 
+# Variants that have been retired from the project but whose stale
+# directories may still exist on Drive.  Filtering here keeps the
+# generated charts free of phantom Parakeet (etc.) artefacts.
+DEPRECATED_VARIANT_PREFIXES: tuple = ("parakeet",)
+
+
+def _is_deprecated(name: str) -> bool:
+    return any(name.startswith(prefix) for prefix in DEPRECATED_VARIANT_PREFIXES)
+
+
 def _collect_results(json_root: Path) -> List[RunResult]:
     out: List[RunResult] = []
     if not json_root.exists():
         logger.error("Missing evaluations JSON root: %s", json_root)
         return out
     for run_dir in sorted(p for p in json_root.iterdir() if p.is_dir()):
+        if _is_deprecated(run_dir.name):
+            logger.info("Skipping deprecated variant directory: %s", run_dir)
+            continue
         data = _read_json(run_dir / "test_results.json")
         if data is None:
             continue
@@ -504,6 +517,8 @@ def render_all(layout: StorageLayout, out_dir: Optional[Path] = None) -> None:
     # 2 & 3) Per-run error breakdown + dialect-pair charts.
     if json_root.exists():
         for run_dir in sorted(p for p in json_root.iterdir() if p.is_dir()):
+            if _is_deprecated(run_dir.name):
+                continue
             plot_error_breakdown(
                 run_dir,
                 out_dir / f"error_breakdown__{_slug(run_dir.name)}.png",
@@ -517,6 +532,8 @@ def render_all(layout: StorageLayout, out_dir: Optional[Path] = None) -> None:
     tb_root = layout.tensorboard
     if tb_root.exists():
         for tb_dir in sorted(p for p in tb_root.iterdir() if p.is_dir()):
+            if _is_deprecated(tb_dir.name):
+                continue
             plot_training_curves(
                 tb_dir,
                 out_dir / f"training_curves__{_slug(tb_dir.name)}.png",

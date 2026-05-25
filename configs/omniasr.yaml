@@ -7,8 +7,8 @@
 #   3. launches ``python -m workflows.recipes.wav2vec2.asr``.
 #
 # fairseq2 + the official omnilingual-asr repo must be installed in
-# the runtime; they are NOT pinned in requirements.txt (Parakeet-style
-# isolation).  See README "OmniASR / fairseq2" section.
+# the runtime; they are NOT pinned in requirements.txt.
+# See README "OmniASR / fairseq2" section.
 #
 # Asset names (resolved by fairseq2's asset card at
 # omnilingual-asr/src/omnilingual_asr/cards/models/rc_models_v1.yaml):

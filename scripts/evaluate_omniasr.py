@@ -690,8 +690,37 @@ def evaluate_omniasr(
     assert primary is not None
     best_step = primary.step
 
-    wer_value: Optional[float] = best_wer.value if best_wer is not None else None
-    cer_value: Optional[float] = best_cer.value if best_cer is not None else None
+    # Unit-mismatch defence:
+    # ----------------------
+    # fairseq2's omnilingual-asr ASR recipe logs WER/CER as PERCENTAGES
+    # (0..100), whereas the rest of this project — and the downstream
+    # aggregator / charts / val-vs-test joiner — expect FRACTIONS (0..1).
+    # Naively storing the raw scalar produces e.g. 10.04 → which the
+    # aggregator then multiplies by 100, rendering as "1003.95 %".
+    #
+    # Strategy: any value above 1.5 (anything > 150 % WER is physically
+    # implausible) is interpreted as a percentage and divided by 100.
+    # The guard keeps the script compatible if fairseq2 ever switches to
+    # logging fractions in a future release.
+    def _to_fraction(raw: Optional[float]) -> Optional[float]:
+        if raw is None:
+            return None
+        return raw / 100.0 if raw > 1.5 else raw
+
+    wer_raw = best_wer.value if best_wer is not None else None
+    cer_raw = best_cer.value if best_cer is not None else None
+    wer_value: Optional[float] = _to_fraction(wer_raw)
+    cer_value: Optional[float] = _to_fraction(cer_raw)
+    if wer_raw is not None and wer_value != wer_raw:
+        logger.info(
+            "Rescaled WER from percentage (%.4f) to fraction (%.6f)",
+            wer_raw, wer_value,
+        )
+    if cer_raw is not None and cer_value != cer_raw:
+        logger.info(
+            "Rescaled CER from percentage (%.4f) to fraction (%.6f)",
+            cer_raw, cer_value,
+        )
 
     checkpoint_path = _find_omniasr_checkpoint(layout, variant)
 

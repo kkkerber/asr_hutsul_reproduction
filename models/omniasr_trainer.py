@@ -9,9 +9,8 @@ the right dataset paths injected, and invokes the official entrypoint::
         --config-file <rendered_yaml>
 
 fairseq2 and the ``omnilingual-asr`` repository are runtime-only
-dependencies — not pinned in ``requirements.txt`` (same isolation
-discipline used for the Parakeet/NeMo pipeline).  Install them in a
-dedicated Colab runtime; see README "OmniASR / fairseq2" section.
+dependencies — not pinned in ``requirements.txt``.  Install them in
+a dedicated Colab runtime; see README "OmniASR / fairseq2" section.
 
 Asset resolution
 ----------------

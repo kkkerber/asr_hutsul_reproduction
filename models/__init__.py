@@ -9,7 +9,6 @@ TRAINER_MODULE_MAP: Dict[str, str] = {
     "wav2vec2": "models.wav2vec2_trainer",
     "wav2vec2_bert": "models.wav2vec2_bert_trainer",
     "omniasr": "models.omniasr_trainer",
-    "parakeet": "models.parakeet_trainer",
 }
 
 

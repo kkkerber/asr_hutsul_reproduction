@@ -269,7 +269,6 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, float]:
         "wav2vec2": "train_wav2vec2",
         "wav2vec2_bert": "train_wav2vec2_bert",
         "omniasr": "train_omniasr",
-        "parakeet": "train_parakeet",
     }[args.model_type]
 
     if not hasattr(trainer_module, train_fn_name):

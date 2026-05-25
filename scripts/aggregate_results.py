@@ -129,12 +129,28 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+# Variants that have been retired from the project but whose stale
+# directories may still exist on Drive.  Any run/checkpoint/tensorboard
+# directory whose name matches one of these prefixes is filtered out by
+# the discovery functions in aggregate_results.py / plot_results.py /
+# val_test_table.py, so no phantom rows or charts re-appear.
+DEPRECATED_VARIANT_PREFIXES: tuple = ("parakeet",)
+
+
+def _is_deprecated(name: str) -> bool:
+    return any(name.startswith(prefix) for prefix in DEPRECATED_VARIANT_PREFIXES)
+
+
 def _collect_run_dirs(json_root: Path) -> List[Path]:
-    """Return every direct subdirectory of ``json_root`` sorted by name."""
+    """Return every direct subdirectory of ``json_root`` sorted by name,
+    skipping any retired variants (see ``DEPRECATED_VARIANT_PREFIXES``)."""
     if not json_root.exists():
         logger.error("Evaluations JSON root does not exist: %s", json_root)
         return []
-    return sorted(p for p in json_root.iterdir() if p.is_dir())
+    return sorted(
+        p for p in json_root.iterdir()
+        if p.is_dir() and not _is_deprecated(p.name)
+    )
 
 
 def _build_row(run_dir: Path) -> Optional[EvalRow]:

@@ -64,3 +64,55 @@ variants:
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 4
     gradient_accumulation_steps: 8
+
+  # ------------------------------------------------------------------
+  # Improved XLSR variant (Task 4 — Option B).
+  # ------------------------------------------------------------------
+  # The baseline ``xlsr-300m-uk`` variant achieved test WER 21.25 % /
+  # CER 3.70 % on the project's held-out split.  The CER is competitive
+  # but the WER is the worst across all evaluated models, driven by
+  # heavy word-segmentation errors — error_analysis.json shows 765
+  # space-deletion events for that run (1.5× the next-worst model).
+  #
+  # The improved variant changes three things — and ONLY these three —
+  # relative to the baseline; the original variant remains untouched
+  # so its results stay reproducible:
+  #
+  #   1. Starting checkpoint
+  #      facebook/wav2vec2-large-xlsr-53     (raw multilingual SSL)
+  #        ↓
+  #      Yehor/wav2vec2-xls-r-300m-uk-with-lm (already CTC-fine-tuned
+  #      on Ukrainian Common Voice + Mozilla; CTC head + Cyrillic
+  #      tokenizer already aligned).  Expected biggest single
+  #      contribution to the WER drop (~5-9 pp).
+  #
+  #   2. Stronger encoder masking / regularisation
+  #      mask_time_prob    0.05 → 0.075   (XLSR paper default)
+  #      mask_feature_prob 0.0  → 0.05    (HF Wav2Vec2 default; was off)
+  #      layerdrop         0.0  → 0.05    (standard low-resource recipe)
+  #      Expected contribution: ~2-4 pp WER.
+  #
+  #   3. Augmentation on + smaller effective batch
+  #      use_augmentation       false → true   (waveform-only;
+  #                                             SpecAugment-like
+  #                                             masking is already
+  #                                             done by mask_*_prob)
+  #      effective_batch        64 → 32  (per_device 8 × accum 4)
+  #      Expected contribution: ~1-3 pp WER.
+  #
+  # Combined expected test WER: 10-13 % (vs 21.25 % baseline).
+  # Test CER is expected to stay in the same range (~3-4 %) or slightly
+  # improve.  Other parts of the trainer (vocab, freeze policy,
+  # eval/save cadence, best-metric=CER, early-stopping patience) are
+  # deliberately unchanged so the variant remains a controlled
+  # extension of the baseline.
+  xlsr-300m-uk-improved:
+    model_name_or_path: Yehor/wav2vec2-xls-r-300m-uk-with-lm
+    max_steps: 5000
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 4         # effective batch 32 (was 64)
+    mask_time_prob: 0.075                   # XLSR paper default
+    mask_feature_prob: 0.05                 # HF Wav2Vec2 default; was off
+    layerdrop: 0.05                         # standard low-resource recipe
+    use_augmentation: true

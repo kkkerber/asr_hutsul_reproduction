@@ -141,18 +141,32 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+# Variants that have been retired from the project but whose stale
+# directories may still exist on Drive.  Filtered out of the val-vs-test
+# table so phantom rows like "parakeet-ctc-0.6b" do not reappear.
+DEPRECATED_VARIANT_PREFIXES: tuple = ("parakeet",)
+
+
+def _is_deprecated(name: str) -> bool:
+    return any(name.startswith(prefix) for prefix in DEPRECATED_VARIANT_PREFIXES)
+
+
 def _discover_variants(layout: StorageLayout) -> List[str]:
     """Discover variants from BOTH the checkpoints/ and evaluations/json/
     trees — so the table also includes evaluation-only runs (e.g. OmniASR)
-    that have no transformers-style ``best_metric.json``."""
+    that have no transformers-style ``best_metric.json``.
+
+    Retired variants (see ``DEPRECATED_VARIANT_PREFIXES``) are filtered
+    out so leftover directories on Drive do not surface as phantom rows.
+    """
     names: set = set()
     if layout.checkpoints.exists():
         for p in layout.checkpoints.iterdir():
-            if p.is_dir():
+            if p.is_dir() and not _is_deprecated(p.name):
                 names.add(p.name)
     if layout.evaluations_json.exists():
         for p in layout.evaluations_json.iterdir():
-            if p.is_dir():
+            if p.is_dir() and not _is_deprecated(p.name):
                 names.add(p.name)
     return sorted(names)
 
