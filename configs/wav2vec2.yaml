@@ -58,8 +58,13 @@ variants:
     per_device_eval_batch_size: 4
     gradient_accumulation_steps: 8
 
+  # ``Yehor/wav2vec2-xls-r-300m-uk-with-lm`` was renamed by the author to
+  # ``Yehor/w2v-xls-r-uk`` and the old slug now 404s for ``from_pretrained``
+  # (HF's HTML 307 redirect does not propagate through the file-resolution
+  # path).  The new repo is the same model with the same tokenizer + an
+  # extra ``language_model/`` directory for KenLM rescoring.
   xlsr-300m-uk-pretrained:
-    model_name_or_path: Yehor/wav2vec2-xls-r-300m-uk-with-lm
+    model_name_or_path: Yehor/w2v-xls-r-uk
     max_steps: 5000
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 4
@@ -81,10 +86,10 @@ variants:
   #   1. Starting checkpoint
   #      facebook/wav2vec2-large-xlsr-53     (raw multilingual SSL)
   #        ↓
-  #      Yehor/wav2vec2-xls-r-300m-uk-with-lm (already CTC-fine-tuned
-  #      on Ukrainian Common Voice + Mozilla; CTC head + Cyrillic
-  #      tokenizer already aligned).  Expected biggest single
-  #      contribution to the WER drop (~5-9 pp).
+  #      Yehor/w2v-xls-r-uk (already CTC-fine-tuned on Ukrainian
+  #      Common Voice; CTC head + Cyrillic tokenizer already aligned;
+  #      includes KenLM under language_model/).  Expected biggest
+  #      single contribution to the WER drop (~5-9 pp).
   #
   #   2. Stronger encoder masking / regularisation
   #      mask_time_prob    0.05 → 0.075   (XLSR paper default)
@@ -107,7 +112,7 @@ variants:
   # deliberately unchanged so the variant remains a controlled
   # extension of the baseline.
   xlsr-300m-uk-improved:
-    model_name_or_path: Yehor/wav2vec2-xls-r-300m-uk-with-lm
+    model_name_or_path: Yehor/w2v-xls-r-uk
     max_steps: 5000
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 4
