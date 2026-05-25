@@ -201,6 +201,16 @@ def build_processor(
 def build_model(
     args: Wav2Vec2TrainArgs, processor: Wav2Vec2Processor
 ) -> Wav2Vec2ForCTC:
+    # ``ignore_mismatched_sizes=True``: when the source checkpoint has
+    # been CTC-fine-tuned with a different vocabulary (e.g. Yehor's
+    # Ukrainian Wav2Vec2 with 40 output tokens), the encoder weights
+    # load normally but the lm_head shape will not match this project's
+    # 39-token Cyrillic vocab.  The flag tells transformers to load the
+    # encoder + drop the mismatched lm_head, re-initialising it from
+    # scratch to match ``vocab_size=len(processor.tokenizer)``.  It is
+    # a no-op when shapes already match (baseline ``xlsr-300m-uk``
+    # starting from facebook/wav2vec2-large-xlsr-53, which has no CTC
+    # head pretrained at all).
     model = Wav2Vec2ForCTC.from_pretrained(
         args.model_name_or_path,
         attention_dropout=args.attention_dropout,
@@ -215,6 +225,7 @@ def build_model(
         vocab_size=len(processor.tokenizer),
         token=args.hf_token,
         trust_remote_code=args.trust_remote_code,
+        ignore_mismatched_sizes=True,
     )
 
     if args.freeze_feature_encoder:
