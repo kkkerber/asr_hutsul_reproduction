@@ -81,3 +81,34 @@ variants:
     per_device_train_batch_size: 4
     per_device_eval_batch_size: 2
     gradient_accumulation_steps: 4
+
+  # ------------------------------------------------------------------
+  # Whisper-large-v3 with paper-matching schedule + augmentation.
+  # ------------------------------------------------------------------
+  # The baseline ``whisper-large-v3`` matched the paper protocol
+  # exactly (8000 steps, eff. batch 16, LoRA r=16 q/v, linear LR with
+  # warmup 500, metric=CER, patience=5) but reproduced 1.09 pp above
+  # paper CER (4.99 vs 3.90) and 1.48 pp above paper WER (14.68 vs
+  # 13.20).  The training-curve analysis showed healthy convergence
+  # (eval CER plateaus in 3.9–4.1 % from step 3500 onwards) — i.e. not
+  # a scheduling bug.  The remaining gap is most plausibly explained
+  # by augmentation, which most ASR papers describe generally and
+  # apply across all models.
+  #
+  # This variant changes ONLY one thing vs the baseline:
+  #     use_augmentation: false  →  true
+  # Single-variable isolation experiment; all other parameters match
+  # the baseline exactly.  Waveform-only augmentation (the Whisper
+  # trainer disables SpecAugment for use_augmentation=true): Gaussian
+  # noise, ±2 semitone pitch shift, 0.8–1.2× time stretch, ±6 dB gain.
+  # Applied to the train split only.
+  #
+  # Expected test result: CER 4.3–4.7 %, WER 13.5–14.0 %
+  # (a 0.3–0.7 pp CER / 0.7–1.2 pp WER improvement vs baseline).
+  whisper-large-v3-aug:
+    model_name_or_path: openai/whisper-large-v3
+    max_steps: 8000
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 2
+    gradient_accumulation_steps: 4
+    use_augmentation: true
