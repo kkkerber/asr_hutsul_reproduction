@@ -255,7 +255,6 @@ DIALECT_SUBSTITUTION_PAIRS: Final[Tuple[Tuple[str, str], ...]] = (
     ("є", "е"),
     ("о", "у"),
     ("ї", "і"),
-    ("щ", "ш"),
 )
 
 
